@@ -18,6 +18,9 @@ class TokenInvalidError(message: String) : Exception(message)
 data class ProxyPass(
     val token: String,
     val expiresAtEpochSeconds: Long?,
+    val quotaMax: Long? = null,
+    val quotaRemaining: Long? = null,
+    val quotaReset: Long? = null,
 )
 
 class GuardianClient(
@@ -40,21 +43,30 @@ class GuardianClient(
             if (token.isEmpty()) throw GuardianHttpError("proxy pass response did not contain a token")
             ProxyPass(
                 token = token,
-
                 expiresAtEpochSeconds = body.optLong("expires_at", 0L).takeIf { it > 0 }
                     ?: jwtExpiryEpochSeconds(token),
+                quotaMax = resp.header("X-Quota-Limit")?.toLongOrNull(),
+                quotaRemaining = resp.header("X-Quota-Remaining")?.toLongOrNull(),
+                quotaReset = resp.header("X-Quota-Reset")?.toLongOrNull(),
             )
         }
     }
 
     suspend fun fetchUserInfo(endpoint: String, accessToken: String): Entitlement = withContext(Dispatchers.IO) {
         val url = "${endpoint.trimEnd('/')}/api/v1/fpn/status"
-        authorizedRequest("GET", url, accessToken).use { resp ->
+        val entitlement = authorizedRequest("GET", url, accessToken).use { resp ->
             val text = resp.body?.string().orEmpty()
             if (resp.code != 200) {
                 throw GuardianHttpError("failed to fetch account info: HTTP ${resp.code}: ${text.take(2048)}", resp.code)
             }
             parseEntitlement(JSONObject(text))
+        }
+
+        if (entitlement.limitedBandwidth) {
+            val pass = runCatching { fetchProxyPass(endpoint, accessToken) }.getOrNull()
+            entitlement.copy(quotaRemaining = pass?.quotaRemaining ?: entitlement.quotaRemaining)
+        } else {
+            entitlement
         }
     }
 
@@ -103,8 +115,10 @@ internal fun jwtExpiryEpochSeconds(token: String): Long? {
     val parts = token.split('.')
     if (parts.size < 2) return null
     val payload = runCatching {
+        var b64 = parts[1]
+        while (b64.length % 4 != 0) b64 += "="
         String(
-            Base64.decode(parts[1], Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP),
+            android.util.Base64.decode(b64, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP),
             Charsets.UTF_8,
         )
     }.getOrNull() ?: return null

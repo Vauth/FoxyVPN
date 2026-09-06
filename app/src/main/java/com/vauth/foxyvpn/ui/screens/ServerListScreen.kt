@@ -20,7 +20,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -53,9 +53,7 @@ fun ServerListScreen(
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    val selectedState by produceState<ProxyCandidate?>(initialValue = null) {
-        value = withContext(Dispatchers.IO) { proxyStateStore.load() }
-    }
+    val selectedState by proxyStateStore.selectedProxyFlow.collectAsState()
 
     LaunchedEffect(Unit) {
         runCatching { serverListClient.fetchCountries() }

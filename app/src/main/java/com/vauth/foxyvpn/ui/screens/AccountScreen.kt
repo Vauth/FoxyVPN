@@ -140,10 +140,11 @@ fun AccountScreen(
                             AccountInfoRow("Account ID", info.uid.ifBlank { "\u2014" })
 
                             AccountInfoRow(
-                                "Data usage",
+                                "Data remaining",
                                 when {
                                     !info.limitedBandwidth -> "Unlimited"
-                                    info.maxBytes != null -> formatBytes(info.maxBytes)
+                                    info.quotaRemaining != null -> formatBytes(info.quotaRemaining)
+                                    info.maxBytes != null -> "Limited to ${formatBytes(info.maxBytes)}"
                                     else -> "Limited"
                                 },
                             )

@@ -207,9 +207,7 @@ class FxaAuthRepository(
             payloadHash = Base64.encodeToString(digest.digest(), Base64.NO_WRAP)
         }
 
-        val normalized = listOf(
-            "hawk.1.header", ts, nonce, method.uppercase(), path, url.host, url.port.toString(), payloadHash, "", "",
-        ).joinToString("\n")
+        val normalized = "hawk.1.header\n$ts\n$nonce\n${method.uppercase()}\n$path\n${url.host}\n${url.port}\n$payloadHash\n\n"
 
         val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(hmacKey, "HmacSHA256")) }
         val macB64 = Base64.encodeToString(mac.doFinal(normalized.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)

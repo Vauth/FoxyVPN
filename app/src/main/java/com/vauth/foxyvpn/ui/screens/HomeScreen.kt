@@ -35,7 +35,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -66,9 +65,7 @@ fun HomeScreen(
     val state by FoxyVpnService.state.collectAsState()
     val lastError by FoxyVpnService.lastError.collectAsState()
 
-    val selectedProxy by produceState<ProxyCandidate?>(initialValue = null, state) {
-        value = withContext(Dispatchers.IO) { app.proxyStateStore.load() }
-    }
+    val selectedProxy by app.proxyStateStore.selectedProxyFlow.collectAsState()
 
     val statusColors = LocalFoxyStatusColors.current
     val targetRingColor = when (state) {

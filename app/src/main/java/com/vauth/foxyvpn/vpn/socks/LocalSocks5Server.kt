@@ -32,19 +32,19 @@ private const val TAG = "LocalSocks5Server"
 private const val SESSION_WAIT_TIMEOUT_MS = 4_000L
 private const val SESSION_WAIT_POLL_INTERVAL_MS = 100L
 
-private const val OPEN_STREAM_TIMEOUT_MS = 10_000L
+private const val OPEN_STREAM_TIMEOUT_MS = 30_000L
 
 private const val HANDSHAKE_TIMEOUT_MS = 10_000
 
 private const val HALF_CLOSE_DRAIN_TIMEOUT_MS = 2 * 60_000L
 
-private const val MAX_CONCURRENT_CLIENT_CONNECTIONS = 512
+private const val MAX_CONCURRENT_CLIENT_CONNECTIONS = 128
 
 private const val ACCEPT_BACKLOG = 128
 
 private const val ACCEPT_ERROR_BACKOFF_MS = 100L
 
-private const val RELAY_BUFFER_BYTES = 64 * 1024
+private const val RELAY_BUFFER_BYTES = 16 * 1024
 
 private const val FAILURE_SUMMARY_INTERVAL_MS = 15_000L
 

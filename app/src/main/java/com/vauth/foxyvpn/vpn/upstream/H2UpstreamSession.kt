@@ -110,7 +110,7 @@ class H2UpstreamSession(
 
     private val group = NioEventLoopGroup(1)
 
-    @Volatile private var currentBearerToken: String = bearerToken
+    private val currentBearerToken: String = bearerToken
 
     private val connectHost: String = edgeAddress?.takeIf { it.isNotBlank() } ?: upstreamHost
 
@@ -120,22 +120,19 @@ class H2UpstreamSession(
     @Volatile private var lastActivityAt = System.currentTimeMillis()
     @Volatile private var awaitingPingAck = false
     @Volatile private var pingSentAt = 0L
-
     @Volatile private var acceptingNewStreams = true
+    private val activeStreams = java.util.concurrent.atomic.AtomicInteger(0)
 
     @Volatile private var closing = false
 
     override val isConnected: Boolean
         get() = parentChannel?.isActive == true && acceptingNewStreams
 
-    override fun updateBearerToken(token: String) {
-        if (token.isBlank() || token == currentBearerToken) return
-        currentBearerToken = token
-        AppLogger.i(
-            TAG,
-            "proxy pass rotated on the live session to $upstreamHost:$upstreamPort; " +
-                "existing streams keep running and new CONNECTs use the new pass",
-        )
+    override fun disableNewStreamsAndCloseWhenIdle() {
+        acceptingNewStreams = false
+        if (activeStreams.get() == 0) {
+            close()
+        }
     }
 
     private fun noteInboundActivity() {
@@ -171,15 +168,20 @@ class H2UpstreamSession(
         val handshakeDone = CompletableDeferred<Unit>()
         val bootstrap = Bootstrap()
             .group(group)
-            .channel(NioSocketChannel::class.java)
+            .channel(FoxyNioSocketChannel::class.java)
 
             .option(ChannelOption.TCP_NODELAY, true)
 
             .option(ChannelOption.SO_KEEPALIVE, true)
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, TCP_CONNECT_TIMEOUT_MS)
             .option(ChannelOption.WRITE_BUFFER_WATER_MARK, PARENT_WRITE_WATER_MARK)
-            .handler(object : ChannelInitializer<NioSocketChannel>() {
-                override fun initChannel(ch: NioSocketChannel) {
+            .handler(object : ChannelInitializer<FoxyNioSocketChannel>() {
+                override fun initChannel(ch: FoxyNioSocketChannel) {
+                    runCatching {
+                        com.vauth.foxyvpn.data.ControlPlaneHttp.socketProtector?.invoke(ch.publicJavaChannel().socket())
+                    }.onFailure {
+                        com.vauth.foxyvpn.data.AppLogger.e(TAG, "failed to protect netty socket", it)
+                    }
 
                     upstreamProxy?.let { proxy -> ch.pipeline().addLast(buildProxyHandler(proxy)) }
 
@@ -454,6 +456,13 @@ class H2UpstreamSession(
             ch
         }
 
+        activeStreams.incrementAndGet()
+        streamChannel.closeFuture().addListener {
+            if (activeStreams.decrementAndGet() == 0 && !acceptingNewStreams) {
+                close()
+            }
+        }
+
         return TunneledStream(
             input = streamInput,
             output = NettyStreamOutput(streamChannel),
@@ -595,8 +604,8 @@ class H2UpstreamSession(
 
         companion object {
 
-            private const val HIGH_WATERMARK_BYTES = 2 * 1024 * 1024
-            private const val LOW_WATERMARK_BYTES = 512 * 1024
+            private const val HIGH_WATERMARK_BYTES = 128 * 1024
+            private const val LOW_WATERMARK_BYTES = 32 * 1024
         }
     }
 }
@@ -628,3 +637,7 @@ private suspend fun ChannelFuture.awaitChannel(): Channel =
             runCatching { channel().close() }
         }
     }
+
+internal class FoxyNioSocketChannel : io.netty.channel.socket.nio.NioSocketChannel() {
+    fun publicJavaChannel(): java.nio.channels.SocketChannel = super.javaChannel() as java.nio.channels.SocketChannel
+}

@@ -11,7 +11,7 @@ interface UpstreamSession : Closeable {
 
     suspend fun openStream(targetHost: String, targetPort: Int): TunneledStream
 
-    fun updateBearerToken(token: String)
+    fun disableNewStreamsAndCloseWhenIdle()
 
     val isConnected: Boolean
 }

@@ -13,8 +13,13 @@ object PingUtil {
         withTimeoutOrNull(TIMEOUT_MS.toLong()) {
             runCatching {
                 val start = System.nanoTime()
-                Socket().use { socket -> socket.connect(InetSocketAddress(host, port), TIMEOUT_MS) }
+                Socket().use { socket ->
+                    com.vauth.foxyvpn.data.ControlPlaneHttp.socketProtector?.invoke(socket)
+                    socket.connect(InetSocketAddress(host, port), TIMEOUT_MS)
+                }
                 ((System.nanoTime() - start) / 1_000_000L).toInt()
+            }.onFailure {
+                com.vauth.foxyvpn.data.AppLogger.d("PingUtil", "ping failed to $host:$port: ${it.message}")
             }.getOrNull()
         }
     }

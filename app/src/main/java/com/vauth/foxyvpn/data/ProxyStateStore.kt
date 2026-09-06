@@ -2,9 +2,14 @@ package com.vauth.foxyvpn.data
 
 import android.content.Context
 import com.vauth.foxyvpn.data.model.ProxyCandidate
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 class ProxyStateStore(context: Context) {
     private val prefs = context.getSharedPreferences("foxyvpn_proxy_state", Context.MODE_PRIVATE)
+
+    private val _selectedProxyFlow = MutableStateFlow<ProxyCandidate?>(load())
+    val selectedProxyFlow: StateFlow<ProxyCandidate?> = _selectedProxyFlow
 
     fun load(): ProxyCandidate? {
         val host = prefs.getString(KEY_HOST, null) ?: return null
@@ -28,12 +33,13 @@ class ProxyStateStore(context: Context) {
             .putString(KEY_CITY_CODE, candidate.cityCode)
             .putInt(KEY_FAILURES, 0)
             .apply()
+        _selectedProxyFlow.value = candidate
     }
 
     fun recordFailure(): Pair<Int, Boolean> {
         val failures = prefs.getInt(KEY_FAILURES, 0) + 1
         if (failures >= FAILURE_THRESHOLD) {
-            prefs.edit().clear().apply()
+            clear()
             return failures to true
         }
         prefs.edit().putInt(KEY_FAILURES, failures).apply()
@@ -42,6 +48,7 @@ class ProxyStateStore(context: Context) {
 
     fun clear() {
         prefs.edit().clear().apply()
+        _selectedProxyFlow.value = null
     }
 
     companion object {

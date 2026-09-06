@@ -737,17 +737,19 @@ private fun SplitTunnelDialog(
     var selected by remember { mutableStateOf(current) }
     var searchQuery by remember { mutableStateOf("") }
 
-    val installedApps = remember {
-        val packageManager = context.packageManager
-        packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-            .asSequence()
-            .filter { it.packageName != context.packageName }
-            .filter { packageManager.getLaunchIntentForPackage(it.packageName) != null }
-            .map { info: ApplicationInfo ->
-                InstalledAppEntry(info.packageName, info.loadLabel(packageManager).toString())
-            }
-            .sortedBy { it.label.lowercase() }
-            .toList()
+    val installedApps by androidx.compose.runtime.produceState<List<InstalledAppEntry>>(initialValue = emptyList()) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val packageManager = context.packageManager
+            packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
+                .asSequence()
+                .filter { it.packageName != context.packageName }
+                .filter { packageManager.getLaunchIntentForPackage(it.packageName) != null }
+                .map { info: android.content.pm.ApplicationInfo ->
+                    InstalledAppEntry(info.packageName, info.loadLabel(packageManager).toString())
+                }
+                .sortedBy { it.label.lowercase() }
+                .toList()
+        }
     }
     val filteredApps = remember(installedApps, searchQuery) {
         if (searchQuery.isBlank()) {
@@ -778,7 +780,11 @@ private fun SplitTunnelDialog(
                         .fillMaxWidth()
                         .padding(bottom = 8.dp),
                 )
-                if (filteredApps.isEmpty()) {
+                if (installedApps.isEmpty()) {
+                    androidx.compose.material3.CircularProgressIndicator(
+                        modifier = Modifier.padding(24.dp).align(Alignment.CenterHorizontally)
+                    )
+                } else if (filteredApps.isEmpty()) {
                     Text(
                         "No apps match \"$searchQuery\".",
                         style = MaterialTheme.typography.bodySmall,

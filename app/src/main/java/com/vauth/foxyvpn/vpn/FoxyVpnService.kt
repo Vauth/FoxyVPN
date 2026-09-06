@@ -46,6 +46,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
@@ -203,6 +204,7 @@ class FoxyVpnService : VpnService() {
 
         if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return
         boundNetwork = network
+        runCatching { ControlPlaneHttp.client.connectionPool.evictAll() }
         if (previous == null) return
 
         if (_state.value != ConnectionState.CONNECTED) return
@@ -261,25 +263,12 @@ class FoxyVpnService : VpnService() {
         lastNotificationText = null
         boundNetwork = null
         reportedUnderlying = null
+        scope.cancel()
         _state.value = ConnectionState.DISCONNECTED
         super.onDestroy()
     }
 
     private fun acquireWakeLocks() {
-        if (wakeLock == null) {
-            runCatching {
-                val power = getSystemService(PowerManager::class.java)
-                    ?: error("PowerManager unavailable")
-                wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG).apply {
-
-                    setReferenceCounted(false)
-                    acquire()
-                }
-                AppLogger.i(TAG, "acquired a CPU wake lock for the session")
-            }.onFailure {
-                AppLogger.w(TAG, "could not acquire a CPU wake lock; the tunnel may stall while the screen is off", it)
-            }
-        }
         if (wifiLock == null) {
             runCatching {
                 val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -294,33 +283,30 @@ class FoxyVpnService : VpnService() {
     }
 
     private fun releaseWakeLocks() {
-        runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
-            .onFailure { AppLogger.d(TAG, "error releasing the CPU wake lock: ${it.message}") }
-        wakeLock = null
         runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
             .onFailure { AppLogger.d(TAG, "error releasing the Wi-Fi lock: ${it.message}") }
         wifiLock = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_CONNECT -> {
+        val action = intent?.action
+        if (action == ACTION_CONNECT || action == VpnService.SERVICE_INTERFACE) {
 
-                if (_state.value != ConnectionState.DISCONNECTED) {
-                    AppLogger.d(TAG, "ignoring duplicate connect request while ${_state.value}")
+            if (_state.value != ConnectionState.DISCONNECTED) {
+                AppLogger.d(TAG, "ignoring duplicate connect request while ${_state.value}")
 
-                    enterForeground(statusLabel)
-                    return START_NOT_STICKY
-                }
-                _state.value = ConnectionState.CONNECTING
-                _lastError.value = null
-                statusLabel = "Connecting\u2026"
                 enterForeground(statusLabel)
-
-                acquireWakeLocks()
-                connectJob = scope.launch { opMutex.withLock { connect() } }
+                return START_NOT_STICKY
             }
-            ACTION_DISCONNECT -> requestDisconnect("requested by the user")
+            _state.value = ConnectionState.CONNECTING
+            _lastError.value = null
+            statusLabel = "Connecting\u2026"
+            enterForeground(statusLabel)
+
+            acquireWakeLocks()
+            connectJob = scope.launch { opMutex.withLock { connect() } }
+        } else if (action == ACTION_DISCONNECT) {
+            requestDisconnect("requested by the user")
         }
         return START_NOT_STICKY
     }
@@ -381,7 +367,7 @@ class FoxyVpnService : VpnService() {
     private fun startProxyPassRenewal(
         myGeneration: Int,
         initialExpiry: Long?,
-        mintPass: suspend () -> ProxyPass,
+        dialNewSession: suspend () -> Pair<com.vauth.foxyvpn.vpn.upstream.H2UpstreamSession, Long?>,
     ) {
         tokenRenewalJob?.cancel()
         tokenRenewalJob = scope.launch {
@@ -401,9 +387,9 @@ class FoxyVpnService : VpnService() {
                     continue
                 }
 
-                val attempt = runCatching { mintPass() }
-                val renewed = attempt.getOrNull()
-                if (renewed == null) {
+                val attempt = runCatching { dialNewSession() }
+                val result = attempt.getOrNull()
+                if (result == null) {
                     val error = attempt.exceptionOrNull()
                     if (error is CancellationException) throw error
                     if (error != null && isFatalUpstreamError(error)) {
@@ -421,11 +407,20 @@ class FoxyVpnService : VpnService() {
                     continue
                 }
 
-                if (myGeneration != connectionGeneration) return@launch
+                val (newSession, newExpiry) = result
 
-                upstreamSession?.updateBearerToken(renewed.token)
-                AppLogger.i(TAG, "proxy pass renewed and swapped into the live session")
-                expiry = renewed.expiresAtEpochSeconds
+                if (myGeneration != connectionGeneration) {
+                    runCatching { newSession.close() }
+                    return@launch
+                }
+
+                val oldSession = upstreamSession
+                upstreamSession = newSession
+                AppLogger.i(TAG, "proxy pass renewed; established a new HTTP/2 tunnel and swapped it into the live session")
+                
+                oldSession?.disableNewStreamsAndCloseWhenIdle()
+                
+                expiry = newExpiry
             }
         }
     }
@@ -609,7 +604,7 @@ class FoxyVpnService : VpnService() {
 
             var currentPassExpiry: Long? = null
 
-            suspend fun dialUpstream(): H2UpstreamSession {
+            suspend fun dialUpstream(): Pair<com.vauth.foxyvpn.vpn.upstream.H2UpstreamSession, Long?> {
                 val target = activeCandidate()
                 val pass = mintProxyPass()
                 currentPassExpiry = pass.expiresAtEpochSeconds
@@ -622,7 +617,7 @@ class FoxyVpnService : VpnService() {
                 val edgeAddress = customEdgeAddress
                     ?: resolveEdgeAddress(target.host, upstreamProxyConfig, dohEndpointAddresses)
 
-                val session = H2UpstreamSession(
+                val session = com.vauth.foxyvpn.vpn.upstream.H2UpstreamSession(
                     target.host,
                     target.port,
                     pass.token,
@@ -637,7 +632,7 @@ class FoxyVpnService : VpnService() {
                     throw failure
                 }
                 AppLogger.i(TAG, "connect: upstream HTTP/2 tunnel established to ${target.authority}")
-                return session
+                return session to pass.expiresAtEpochSeconds
             }
 
             var dialAttempt = 0
@@ -647,7 +642,7 @@ class FoxyVpnService : VpnService() {
                 ensureGenerationCurrent(myGeneration)
                 val target = activeCandidate()
 
-                val session = try {
+                val dialResult = try {
                     withTimeout(CONNECT_TIMEOUT_MS) { dialUpstream() }
                 } catch (cancellation: CancellationException) {
 
@@ -662,6 +657,8 @@ class FoxyVpnService : VpnService() {
                     AppLogger.w(TAG, "dial to ${target.authority} failed (attempt $dialAttempt): ${error.message}")
                     null
                 }
+
+                val session = dialResult?.first
 
                 if (session != null) {
                     if (myGeneration != connectionGeneration) {
@@ -724,7 +721,7 @@ class FoxyVpnService : VpnService() {
             updateNotification(connectedText)
             AppLogger.i(TAG, "connect: CONNECTED via ${establishedCandidate.authority}")
 
-            startProxyPassRenewal(myGeneration, currentPassExpiry) { mintProxyPass() }
+            startProxyPassRenewal(myGeneration, currentPassExpiry) { dialUpstream() }
 
             if (settingsStore.exitCheckEnabled) {
                 scope.launch {
@@ -794,7 +791,7 @@ class FoxyVpnService : VpnService() {
                     statusLabel = "Reconnecting\u2026"
                     updateNotification(statusLabel)
 
-                    val fresh = try {
+                    val dialResult = try {
                         withTimeout(CONNECT_TIMEOUT_MS) { dialUpstream() }
                     } catch (cancellation: CancellationException) {
                         if (cancellation !is TimeoutCancellationException) throw cancellation
@@ -810,6 +807,7 @@ class FoxyVpnService : VpnService() {
                         AppLogger.w(TAG, "upstream reconnect attempt $consecutiveFailures failed: ${error.message}")
                         null
                     }
+                    val fresh = dialResult?.first
 
                     if (fresh == null) {
 
@@ -844,7 +842,7 @@ class FoxyVpnService : VpnService() {
                     updateNotification(statusLabel)
                     AppLogger.i(TAG, "upstream tunnel reconnected via ${activeCandidate().authority}")
 
-                    startProxyPassRenewal(myGeneration, currentPassExpiry) { mintProxyPass() }
+                    startProxyPassRenewal(myGeneration, currentPassExpiry) { dialUpstream() }
                 }
             }
         }.onFailure { failure ->

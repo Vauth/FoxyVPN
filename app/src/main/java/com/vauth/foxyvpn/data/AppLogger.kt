@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicLong
 enum class LogLevel { INFO, WARN, ERROR }
 
 data class LogEntry(
+    val id: Long,
     val timestampMillis: Long,
     val level: LogLevel,
     val tag: String,
@@ -58,11 +59,21 @@ object AppLogger {
         log(LogLevel.ERROR, tag, if (error != null) "$message: ${error.message}" else message)
     }
 
-    private fun log(level: LogLevel, tag: String, message: String) {
-        buffer.addLast(LogEntry(System.currentTimeMillis(), level, tag, message))
+    private val currentSize = java.util.concurrent.atomic.AtomicInteger(0)
 
-        while (buffer.size > MAX_ENTRIES) {
-            if (buffer.pollFirst() == null) break
+    private val entryCounter = java.util.concurrent.atomic.AtomicLong(0)
+
+    private fun log(level: LogLevel, tag: String, message: String) {
+        buffer.addLast(LogEntry(entryCounter.incrementAndGet(), System.currentTimeMillis(), level, tag, message))
+        var current = currentSize.incrementAndGet()
+
+        while (current > MAX_ENTRIES) {
+            if (buffer.pollFirst() != null) {
+                current = currentSize.decrementAndGet()
+            } else {
+                currentSize.set(0)
+                break
+            }
         }
         schedulePublish()
     }
@@ -91,6 +102,7 @@ object AppLogger {
 
     fun clear() {
         buffer.clear()
+        currentSize.set(0)
         _entries.value = emptyList()
     }
 

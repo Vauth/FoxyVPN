@@ -164,7 +164,7 @@ fun LogsScreen(onBack: () -> Unit) {
                 }
             } else {
                 LazyColumn(Modifier.fillMaxSize()) {
-                    items(visible.asReversed()) { entry ->
+                    items(visible.asReversed(), key = { it.id }) { entry ->
                         val color = when (entry.level) {
                             LogLevel.ERROR -> MaterialTheme.colorScheme.error
                             LogLevel.WARN -> MaterialTheme.colorScheme.tertiary

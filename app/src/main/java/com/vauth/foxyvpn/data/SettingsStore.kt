@@ -165,14 +165,17 @@ class SettingsStore(context: Context) {
             "9.9.9.9" to "Quad9 (9.9.9.9)",
         )
 
-        fun isValidDnsServer(value: String): Boolean {
-            val parts = value.split('.')
-            if (parts.size != 4) return false
+        fun isValidIpAddress(value: String): Boolean {
+            return if (android.os.Build.VERSION.SDK_INT >= 29) {
+                android.net.InetAddresses.isNumericAddress(value)
+            } else {
+                @Suppress("DEPRECATION")
+                android.util.Patterns.IP_ADDRESS.matcher(value).matches()
+            }
+        }
 
-            if (parts.any { it.length > 1 && it.startsWith("0") }) return false
-            val octets = parts.map { part -> part.toIntOrNull() ?: return false }
-            if (octets.any { it !in 0..255 }) return false
-            return octets[0] != 0 && octets[0] != 127 && octets[0] < 224
+        fun isValidDnsServer(value: String): Boolean {
+            return isValidIpAddress(value)
         }
 
         fun isValidHostname(value: String): Boolean {
@@ -196,27 +199,7 @@ class SettingsStore(context: Context) {
 
         fun isValidEdgeHost(value: String): Boolean {
             val host = value.trim().removeSuffix(".")
-            if (host.isEmpty() || host.length > 253) return false
-
-            if (host.contains(':')) {
-                if (host.count { it == ':' } > 8) return false
-                val compressed = host.contains("::")
-                val groups = host.split(':').filter { it.isNotEmpty() }
-                if (groups.isEmpty() || groups.size > 8) return false
-                if (!compressed && groups.size != 8) return false
-                return groups.all { group ->
-                    group.length <= 4 && group.all { char -> char.isDigit() || char.lowercaseChar() in 'a'..'f' }
-                }
-            }
-
-            if (host.all { it.isDigit() || it == '.' }) {
-                val parts = host.split('.')
-                if (parts.size != 4) return false
-                if (parts.any { it.length > 1 && it.startsWith("0") }) return false
-                val octets = parts.map { part -> part.toIntOrNull() ?: return false }
-                return octets.all { it in 0..255 } && octets[0] != 0 && octets[0] != 127
-            }
-            return isValidHostname(host)
+            return isValidHostname(host) || isValidIpAddress(host)
         }
     }
 }

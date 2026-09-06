@@ -77,7 +77,7 @@ gradle :app:assembleRelease --no-daemon
 
 ### 📝 To-Do List
 The project is on test phase so not much yet.
-- [ ] Improve stability.
+- [x] Improve stability.
 - [ ] HTTP/3 implementation.
 - [ ] Better Logo.
 

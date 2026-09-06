@@ -46,6 +46,7 @@ data class Entitlement(
     val uid: String,
     val maxBytes: Long?,
     val limitedBandwidth: Boolean,
+    val quotaRemaining: Long? = null,
 )
 
 data class RuntimeAuth(

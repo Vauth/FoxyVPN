@@ -184,7 +184,7 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
 
     private fun solveOnHost(base: String) {
         val solverJar = SimpleCookieJar()
-        val solver = OkHttpClient.Builder()
+        val solver = ControlPlaneHttp.client.newBuilder()
             .cookieJar(solverJar)
             .connectTimeout(SOLVE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(SOLVE_TIMEOUT_SECONDS, TimeUnit.SECONDS)

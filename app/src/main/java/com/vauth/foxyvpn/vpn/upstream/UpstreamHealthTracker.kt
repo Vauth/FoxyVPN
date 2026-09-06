@@ -58,7 +58,7 @@ class UpstreamHealthTracker {
 
     companion object {
 
-        const val MAX_DISTINCT_TIMEOUT_TARGETS = 3
+        const val MAX_DISTINCT_TIMEOUT_TARGETS = 10
 
         val SESSION_FATAL_STATUS_CODES = setOf(401, 403, 407)
 
