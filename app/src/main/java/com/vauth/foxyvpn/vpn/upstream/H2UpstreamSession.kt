@@ -638,6 +638,7 @@ private suspend fun ChannelFuture.awaitChannel(): Channel =
         }
     }
 
+@androidx.annotation.Keep
 internal class FoxyNioSocketChannel : io.netty.channel.socket.nio.NioSocketChannel() {
     fun publicJavaChannel(): java.nio.channels.SocketChannel = super.javaChannel() as java.nio.channels.SocketChannel
 }
