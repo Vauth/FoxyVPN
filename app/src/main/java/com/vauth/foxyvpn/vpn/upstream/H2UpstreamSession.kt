@@ -1,5 +1,6 @@
 package com.vauth.foxyvpn.vpn.upstream
 
+import android.os.Build
 import com.vauth.foxyvpn.BuildConfig
 import com.vauth.foxyvpn.data.AppLogger
 import io.netty.bootstrap.Bootstrap
@@ -12,7 +13,6 @@ import io.netty.channel.ChannelOption
 import io.netty.channel.SimpleChannelInboundHandler
 import io.netty.channel.WriteBufferWaterMark
 import io.netty.channel.nio.NioEventLoopGroup
-import io.netty.channel.socket.nio.NioSocketChannel
 import io.netty.handler.codec.http2.DefaultHttp2DataFrame
 import io.netty.handler.codec.http2.DefaultHttp2Headers
 import io.netty.handler.codec.http2.DefaultHttp2HeadersFrame
@@ -28,6 +28,7 @@ import io.netty.handler.codec.http2.Http2MultiplexHandler
 import io.netty.handler.codec.http2.Http2PingFrame
 import io.netty.handler.codec.http2.Http2ResetFrame
 import io.netty.handler.codec.http2.Http2Settings
+import io.netty.handler.codec.http2.Http2SettingsFrame
 import io.netty.handler.codec.http2.Http2StreamChannel
 import io.netty.handler.codec.http2.Http2StreamChannelBootstrap
 import io.netty.handler.codec.http2.Http2StreamFrame
@@ -56,21 +57,25 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
+import java.security.Provider
+import java.security.Security
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val TAG = "H2UpstreamSession"
 
-private const val KEEPALIVE_CHECK_INTERVAL_MS = 5_000L
-private const val KEEPALIVE_IDLE_THRESHOLD_MS = 30_000L
-private const val KEEPALIVE_PING_TIMEOUT_MS = 15_000L
+private const val KEEPALIVE_CHECK_INTERVAL_MS = 3_000L
+private const val KEEPALIVE_IDLE_THRESHOLD_MS = 15_000L
+private const val KEEPALIVE_PING_TIMEOUT_MS = 10_000L
 
 private const val KEEPALIVE_PING_PAYLOAD = 0x466F78795650_4EL
 
@@ -79,6 +84,17 @@ private const val OPEN_STREAM_TIMEOUT_MS = 20_000L
 private const val TCP_CONNECT_TIMEOUT_MS = 15_000
 
 private const val TLS_ENDPOINT_IDENTIFICATION_HTTPS = "HTTPS"
+
+private const val CONSCRYPT_PROVIDER_NAME = "Conscrypt"
+
+private val TLS_PROVIDER: Provider? = runCatching { Security.getProvider(CONSCRYPT_PROVIDER_NAME) }.getOrNull()
+
+private val TLS_PROTOCOLS: Array<String> =
+    if (TLS_PROVIDER != null || Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        arrayOf("TLSv1.3", "TLSv1.2")
+    } else {
+        arrayOf("TLSv1.2")
+    }
 
 private const val HTTP2_FLOW_CONTROL_WINDOW_BYTES = 16 * 1024 * 1024
 
@@ -89,6 +105,14 @@ private val STREAM_WRITE_WATER_MARK = WriteBufferWaterMark(512 * 1024, 2 * 1024 
 private val PARENT_WRITE_WATER_MARK = WriteBufferWaterMark(1024 * 1024, 4 * 1024 * 1024)
 
 private const val WRITE_BACKPRESSURE_TIMEOUT_MS = 60_000L
+
+private const val STREAM_SLOT_WAIT_TIMEOUT_MS = 15_000L
+
+private const val STREAM_SLOT_POLL_INTERVAL_MS = 20L
+
+private const val DRAIN_IDLE_TIMEOUT_MS = 120_000L
+
+private const val DRAIN_POLL_INTERVAL_MS = 250L
 
 data class UpstreamProxyConfig(
     val type: Type,
@@ -110,7 +134,7 @@ class H2UpstreamSession(
 
     private val group = NioEventLoopGroup(1)
 
-    private val currentBearerToken: String = bearerToken
+    @Volatile private var currentBearerToken: String = bearerToken
 
     private val connectHost: String = edgeAddress?.takeIf { it.isNotBlank() } ?: upstreamHost
 
@@ -118,19 +142,60 @@ class H2UpstreamSession(
     private var parentChannel: Channel? = null
 
     @Volatile private var lastActivityAt = System.currentTimeMillis()
+
+    @Volatile private var lastStreamDataAt = System.currentTimeMillis()
     @Volatile private var awaitingPingAck = false
     @Volatile private var pingSentAt = 0L
     @Volatile private var acceptingNewStreams = true
-    private val activeStreams = java.util.concurrent.atomic.AtomicInteger(0)
+    private val activeStreams = AtomicInteger(0)
+
+    @Volatile private var maxConcurrentStreams = Int.MAX_VALUE
+
+    private val closed = AtomicBoolean(false)
 
     @Volatile private var closing = false
+
+    private val drainWatcherArmed = AtomicBoolean(false)
 
     override val isConnected: Boolean
         get() = parentChannel?.isActive == true && acceptingNewStreams
 
+    override fun updateBearerToken(token: String) {
+        if (token.isBlank() || token == currentBearerToken) return
+        currentBearerToken = token
+        AppLogger.i(
+            TAG,
+            "proxy pass swapped into the live session; the existing HTTP/2 tunnel keeps running and " +
+                "subsequent flows authenticate with the new pass",
+        )
+    }
+
     override fun disableNewStreamsAndCloseWhenIdle() {
         acceptingNewStreams = false
         if (activeStreams.get() == 0) {
+            close()
+            return
+        }
+
+        if (!drainWatcherArmed.compareAndSet(false, true)) return
+
+        lastStreamDataAt = System.currentTimeMillis()
+        keepaliveScope.launch {
+
+            while (activeStreams.get() > 0 &&
+                System.currentTimeMillis() - lastStreamDataAt < DRAIN_IDLE_TIMEOUT_MS
+            ) {
+                delay(DRAIN_POLL_INTERVAL_MS)
+            }
+            val stranded = activeStreams.get()
+            if (stranded > 0) {
+                AppLogger.w(
+                    TAG,
+                    "a swapped-out upstream session has moved no data for " +
+                        "${DRAIN_IDLE_TIMEOUT_MS / 1_000}s with $stranded flow(s) still open; closing it so its " +
+                        "socket and event loop are not held for the lifetime of the tunnel",
+                )
+            }
             close()
         }
     }
@@ -140,11 +205,18 @@ class H2UpstreamSession(
         if (awaitingPingAck) awaitingPingAck = false
     }
 
+    private fun noteStreamData() {
+        val now = System.currentTimeMillis()
+        lastActivityAt = now
+
+        lastStreamDataAt = now
+    }
+
     override suspend fun connect() = withContext(Dispatchers.IO) {
 
-        val sslContext: SslContext = SslContextBuilder.forClient()
+        val sslContextBuilder = SslContextBuilder.forClient()
             .sslProvider(SslProvider.JDK)
-            .protocols("TLSv1.3", "TLSv1.2")
+            .protocols(*TLS_PROTOCOLS)
             .applicationProtocolConfig(
                 ApplicationProtocolConfig(
                     ApplicationProtocolConfig.Protocol.ALPN,
@@ -155,7 +227,18 @@ class H2UpstreamSession(
                 ),
             )
             .ciphers(null, SupportedCipherSuiteFilter.INSTANCE)
-            .build()
+
+        val tlsProvider = TLS_PROVIDER
+        if (tlsProvider != null) {
+            sslContextBuilder.sslContextProvider(tlsProvider)
+        } else {
+            AppLogger.w(
+                TAG,
+                "Conscrypt is unavailable; falling back to the platform TLS stack " +
+                    "(protocols=${TLS_PROTOCOLS.joinToString()})",
+            )
+        }
+        val sslContext: SslContext = sslContextBuilder.build()
 
         if (connectHost != upstreamHost) {
             AppLogger.i(
@@ -197,7 +280,8 @@ class H2UpstreamSession(
                         .initialSettings(
                             Http2Settings.defaultSettings()
                                 .initialWindowSize(HTTP2_FLOW_CONTROL_WINDOW_BYTES)
-                                .maxFrameSize(HTTP2_MAX_FRAME_SIZE_BYTES),
+                                .maxFrameSize(HTTP2_MAX_FRAME_SIZE_BYTES)
+                                .pushEnabled(false),
                         )
 
                         .autoAckPingFrame(false)
@@ -223,6 +307,22 @@ class H2UpstreamSession(
                                         "upstream sent GOAWAY: errorCode=${msg.errorCode()} lastStreamId=${msg.lastStreamId()} reason=\"$reason\"",
                                     )
                                     msg.release()
+                                }
+                                is Http2SettingsFrame -> {
+
+                                    val announced = msg.settings().maxConcurrentStreams()
+                                    if (announced != null) {
+
+                                        val limit = announced.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+                                        if (limit != maxConcurrentStreams) {
+                                            maxConcurrentStreams = limit
+                                            AppLogger.i(
+                                                TAG,
+                                                "upstream allows $limit concurrent stream(s); new flows will wait " +
+                                                    "for a free slot instead of being refused",
+                                            )
+                                        }
+                                    }
                                 }
                                 is Http2PingFrame -> {
 
@@ -254,12 +354,22 @@ class H2UpstreamSession(
                         }
 
                         override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-                            AppLogger.e(
-                                TAG,
-                                "upstream channel error to $upstreamHost:$upstreamPort (often a TLS/ALPN handshake or, " +
-                                    "if an upstream proxy is configured, a proxy CONNECT failure)",
-                                cause,
-                            )
+
+                            if (closing || handshakeDone.isCompleted) {
+
+                                AppLogger.w(
+                                    TAG,
+                                    "upstream connection to $upstreamHost:$upstreamPort dropped: ${cause.message} " +
+                                        "(usually the network changed underneath it)",
+                                )
+                            } else {
+                                AppLogger.e(
+                                    TAG,
+                                    "upstream channel error to $upstreamHost:$upstreamPort (often a TLS/ALPN handshake or, " +
+                                        "if an upstream proxy is configured, a proxy CONNECT failure)",
+                                    cause,
+                                )
+                            }
                             if (!handshakeDone.isCompleted) handshakeDone.completeExceptionally(cause)
                             ctx.close()
                         }
@@ -298,6 +408,7 @@ class H2UpstreamSession(
         parentChannel = bootstrap.connect(connectHost, upstreamPort).awaitChannel()
         handshakeDone.await()
         lastActivityAt = System.currentTimeMillis()
+        lastStreamDataAt = System.currentTimeMillis()
 
         parentChannel?.writeAndFlush(
             DefaultHttp2WindowUpdateFrame(HTTP2_FLOW_CONTROL_WINDOW_BYTES - Http2CodecUtil.DEFAULT_WINDOW_SIZE),
@@ -328,7 +439,8 @@ class H2UpstreamSession(
 
     private fun startKeepalive() {
         keepaliveScope.launch {
-            while (isActive && isConnected) {
+
+            while (isActive && parentChannel?.isActive == true && !closed.get()) {
                 delay(KEEPALIVE_CHECK_INTERVAL_MS)
                 val now = System.currentTimeMillis()
                 val idleFor = now - lastActivityAt
@@ -353,6 +465,43 @@ class H2UpstreamSession(
         }
     }
 
+    private fun releaseStreamSlot() {
+        if (activeStreams.decrementAndGet() == 0 && !acceptingNewStreams) {
+            close()
+        }
+    }
+
+    private fun tryReserveStreamSlot(): Boolean {
+        while (true) {
+            val inFlight = activeStreams.get()
+            if (inFlight >= maxConcurrentStreams) return false
+
+            if (activeStreams.compareAndSet(inFlight, inFlight + 1)) return true
+        }
+    }
+
+    private suspend fun reserveStreamSlot(authority: String) {
+        if (tryReserveStreamSlot()) return
+
+        val acquired = withTimeoutOrNull(STREAM_SLOT_WAIT_TIMEOUT_MS) {
+            while (!tryReserveStreamSlot()) {
+                if (!isConnected) {
+                    throw IOException("H2UpstreamSession closed while waiting for a free stream slot")
+                }
+                delay(STREAM_SLOT_POLL_INTERVAL_MS)
+            }
+            true
+        }
+        if (acquired == null) {
+            throw UpstreamConnectTimeoutException(
+                authority = authority,
+                message = "Timed out waiting for one of the upstream's $maxConcurrentStreams concurrent " +
+                    "stream slots to free up",
+                cause = IOException("upstream concurrent stream limit reached"),
+            )
+        }
+    }
+
     override suspend fun openStream(targetHost: String, targetPort: Int): TunneledStream {
 
         val parent = parentChannel ?: throw IOException("H2UpstreamSession is not connected")
@@ -363,114 +512,124 @@ class H2UpstreamSession(
         val responseHeaders = CompletableDeferred<Unit>()
         val streamInput = NettyStreamInput()
 
-        val streamChannel = run {
-            val streamChannelFuture = Http2StreamChannelBootstrap(parent)
+        reserveStreamSlot(authority)
 
-                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, STREAM_WRITE_WATER_MARK)
-                .handler(object : SimpleChannelInboundHandler<Http2StreamFrame>() {
-                    override fun channelActive(ctx: ChannelHandlerContext) {
-                        streamInput.attachChannel(ctx.channel() as Http2StreamChannel)
-                        super.channelActive(ctx)
-                    }
+        var handedOff = false
+        try {
+            val streamChannel = run {
+                val streamChannelFuture = Http2StreamChannelBootstrap(parent)
 
-                    override fun channelRead0(ctx: ChannelHandlerContext, frame: Http2StreamFrame) {
-                        noteInboundActivity()
-                        when (frame) {
-                            is Http2HeadersFrame -> {
+                    .option(ChannelOption.WRITE_BUFFER_WATER_MARK, STREAM_WRITE_WATER_MARK)
+                    .handler(object : SimpleChannelInboundHandler<Http2StreamFrame>() {
+                        override fun channelActive(ctx: ChannelHandlerContext) {
+                            streamInput.attachChannel(ctx.channel() as Http2StreamChannel)
+                            super.channelActive(ctx)
+                        }
 
-                                val statusText = frame.headers().status()?.toString()
+                        override fun channelRead0(ctx: ChannelHandlerContext, frame: Http2StreamFrame) {
+                            noteInboundActivity()
+                            when (frame) {
+                                is Http2HeadersFrame -> {
 
-                                val statusCode = statusText?.trim()?.toIntOrNull()
-                                if (statusCode != null && statusCode in 200..299) {
-                                    if (!responseHeaders.isCompleted) responseHeaders.complete(Unit)
-                                } else {
-                                    val cause = UpstreamConnectRejectedException(
-                                        statusCode = statusCode,
-                                        authority = authority,
-                                        message = "Upstream rejected CONNECT to $authority: status=${statusText ?: "<missing>"}",
-                                    )
-                                    if (!responseHeaders.isCompleted) responseHeaders.completeExceptionally(cause)
-                                    ctx.close()
+                                    val statusText = frame.headers().status()?.toString()
+
+                                    val statusCode = statusText?.trim()?.toIntOrNull()
+                                    if (statusCode != null && statusCode in 200..299) {
+                                        if (!responseHeaders.isCompleted) responseHeaders.complete(Unit)
+                                    } else {
+                                        val cause = UpstreamConnectRejectedException(
+                                            statusCode = statusCode,
+                                            authority = authority,
+                                            message = "Upstream rejected CONNECT to $authority: status=${statusText ?: "<missing>"}",
+                                        )
+                                        if (!responseHeaders.isCompleted) responseHeaders.completeExceptionally(cause)
+                                        ctx.close()
+                                    }
                                 }
+                                is Http2DataFrame -> {
+
+                                    noteStreamData()
+                                    val bytes = ByteArray(frame.content().readableBytes())
+                                    frame.content().readBytes(bytes)
+                                    streamInput.offerData(bytes)
+                                    if (frame.isEndStream) streamInput.offerEnd()
+                                }
+                                is Http2ResetFrame -> {
+                                    val streamId = (ctx.channel() as Http2StreamChannel).stream().id()
+                                    val cause = IOException("Upstream reset stream $streamId (errorCode=${frame.errorCode()})")
+                                    AppLogger.d(TAG, "upstream reset stream $streamId: errorCode=${frame.errorCode()}")
+                                    if (!responseHeaders.isCompleted) responseHeaders.completeExceptionally(cause)
+                                    streamInput.offerError(cause)
+                                }
+                                else -> Unit
                             }
-                            is Http2DataFrame -> {
-                                val bytes = ByteArray(frame.content().readableBytes())
-                                frame.content().readBytes(bytes)
-                                streamInput.offerData(bytes)
-                                if (frame.isEndStream) streamInput.offerEnd()
-                            }
-                            is Http2ResetFrame -> {
-                                val streamId = (ctx.channel() as Http2StreamChannel).stream().id()
-                                val cause = IOException("Upstream reset stream $streamId (errorCode=${frame.errorCode()})")
-                                AppLogger.d(TAG, "upstream reset stream $streamId: errorCode=${frame.errorCode()}")
-                                if (!responseHeaders.isCompleted) responseHeaders.completeExceptionally(cause)
-                                streamInput.offerError(cause)
-                            }
-                            else -> Unit
                         }
-                    }
 
-                    override fun channelInactive(ctx: ChannelHandlerContext) {
+                        override fun channelInactive(ctx: ChannelHandlerContext) {
 
-                        if (!responseHeaders.isCompleted) {
-                            responseHeaders.completeExceptionally(
-                                IOException("Upstream stream closed before CONNECT completed"),
-                            )
+                            if (!responseHeaders.isCompleted) {
+                                responseHeaders.completeExceptionally(
+                                    IOException("Upstream stream closed before CONNECT completed"),
+                                )
+                            }
+                            streamInput.offerEnd()
+                            super.channelInactive(ctx)
                         }
-                        streamInput.offerEnd()
-                        super.channelInactive(ctx)
-                    }
-                })
-                .open()
+                    })
+                    .open()
 
-            val ch = try {
-                withTimeout(OPEN_STREAM_TIMEOUT_MS) { awaitStreamChannel(streamChannelFuture) }
-            } catch (e: TimeoutCancellationException) {
+                val ch = try {
+                    withTimeout(OPEN_STREAM_TIMEOUT_MS) { awaitStreamChannel(streamChannelFuture) }
+                } catch (e: TimeoutCancellationException) {
 
-                throw UpstreamConnectTimeoutException(
-                    authority = authority,
-                    message = "Timed out opening HTTP/2 stream channel to $upstreamHost:$upstreamPort",
-                    cause = e,
-                )
+                    throw UpstreamConnectTimeoutException(
+                        authority = authority,
+                        message = "Timed out opening HTTP/2 stream channel to $upstreamHost:$upstreamPort",
+                        cause = e,
+                    )
+                }
+
+                val headers = DefaultHttp2Headers().apply {
+                    method("CONNECT")
+                    authority(authority)
+
+                    add("proxy-authorization", "Bearer $currentBearerToken")
+                }
+                ch.writeAndFlush(DefaultHttp2HeadersFrame(headers, false))
+
+                try {
+                    withTimeout(OPEN_STREAM_TIMEOUT_MS) { responseHeaders.await() }
+                } catch (e: TimeoutCancellationException) {
+                    ch.close()
+                    throw UpstreamConnectTimeoutException(
+                        authority = authority,
+                        message = "Timed out waiting for CONNECT response from $upstreamHost:$upstreamPort ($authority)",
+                        cause = e,
+                    )
+                }
+
+                ch
             }
 
-            val headers = DefaultHttp2Headers().apply {
-                method("CONNECT")
-                authority(authority)
-
-                add("proxy-authorization", "Bearer $currentBearerToken")
+            streamChannel.closeFuture().addListener {
+                releaseStreamSlot()
             }
-            ch.writeAndFlush(DefaultHttp2HeadersFrame(headers, false))
+            handedOff = true
 
-            try {
-                withTimeout(OPEN_STREAM_TIMEOUT_MS) { responseHeaders.await() }
-            } catch (e: TimeoutCancellationException) {
-                ch.close()
-                throw UpstreamConnectTimeoutException(
-                    authority = authority,
-                    message = "Timed out waiting for CONNECT response from $upstreamHost:$upstreamPort ($authority)",
-                    cause = e,
-                )
-            }
+            return TunneledStream(
+                input = streamInput,
+                output = NettyStreamOutput(streamChannel),
+                close = { streamChannel.close() },
+            )
+        } finally {
 
-            ch
+            if (!handedOff) releaseStreamSlot()
         }
-
-        activeStreams.incrementAndGet()
-        streamChannel.closeFuture().addListener {
-            if (activeStreams.decrementAndGet() == 0 && !acceptingNewStreams) {
-                close()
-            }
-        }
-
-        return TunneledStream(
-            input = streamInput,
-            output = NettyStreamOutput(streamChannel),
-            close = { streamChannel.close() },
-        )
     }
 
     override fun close() {
+
+        if (!closed.compareAndSet(false, true)) return
         closing = true
         keepaliveScope.cancel()
         parentChannel?.close()
@@ -485,7 +644,7 @@ class H2UpstreamSession(
         }
     }
 
-    private class NettyStreamOutput(
+    private inner class NettyStreamOutput(
         private val streamChannel: Http2StreamChannel,
     ) : OutputStream() {
         override fun write(b: Int) = write(byteArrayOf(b.toByte()))
@@ -493,6 +652,8 @@ class H2UpstreamSession(
         override fun write(b: ByteArray, off: Int, len: Int) {
             if (len <= 0) return
             if (!streamChannel.isActive) throw IOException("Upstream stream is closed")
+
+            noteStreamData()
             val buf = streamChannel.alloc().buffer(len).writeBytes(b, off, len)
             val future = streamChannel.writeAndFlush(DefaultHttp2DataFrame(buf, false))
 

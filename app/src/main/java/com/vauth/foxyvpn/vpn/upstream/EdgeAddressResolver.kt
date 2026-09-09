@@ -2,9 +2,10 @@ package com.vauth.foxyvpn.vpn.upstream
 
 import com.vauth.foxyvpn.data.AppLogger
 import com.vauth.foxyvpn.data.ControlPlaneHttp
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -15,6 +16,7 @@ import java.io.InputStream
 import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val TAG = "EdgeAddressResolver"
 
@@ -47,7 +49,7 @@ private const val READ_CHUNK_BYTES = 2048
 
 private const val CACHE_TTL_MS = 5 * 60_000L
 
-private const val FAILURE_BACKOFF_MS = 5 * 60_000L
+private const val FAILURE_BACKOFF_MS = 30 * 60_000L
 
 internal object EdgeAddressResolver {
 
@@ -114,33 +116,42 @@ internal object EdgeAddressResolver {
 
         val inFlight = ConcurrentHashMap<String, Call>()
 
-        val attempts = endpoints.map { endpoint ->
+        val winner = CompletableDeferred<Pair<String, List<String>>?>()
+        val outstanding = AtomicInteger(endpoints.size)
 
-            endpoint to async(Dispatchers.IO) { queryOne(endpoint, queryV4, queryV6, inFlight) }
-        }
-        try {
-            for ((endpoint, attempt) in attempts) {
-                val addresses = attempt.await()
+        val attempts = endpoints.map { endpoint ->
+            launch(Dispatchers.IO) {
+                val addresses = queryOne(endpoint, queryV4, queryV6, inFlight)
                 if (addresses == null) {
 
                     suppressedUntilMs[endpoint] = System.currentTimeMillis() + FAILURE_BACKOFF_MS
-                    continue
-                }
-                if (addresses.isEmpty()) {
+                } else if (addresses.isNotEmpty()) {
+                    suppressedUntilMs.remove(endpoint)
 
-                    continue
+                    winner.complete(endpoint to addresses)
+                    return@launch
                 }
-                suppressedUntilMs.remove(endpoint)
+
+                if (outstanding.decrementAndGet() == 0) winner.complete(null)
+            }
+        }
+
+        try {
+            val result = winner.await()
+            if (result == null) {
+                emptyList()
+            } else {
+                val (endpoint, addresses) = result
                 AppLogger.i(
                     TAG,
                     "resolved $host over DNS-over-HTTPS via $endpoint (${addresses.size} address(es))",
                 )
-                return@coroutineScope addresses
+                addresses
             }
-            emptyList()
         } finally {
+
             inFlight.values.forEach { runCatching { it.cancel() } }
-            attempts.forEach { (_, attempt) -> attempt.cancel() }
+            attempts.forEach { it.cancel() }
         }
     }
 
@@ -157,7 +168,7 @@ internal object EdgeAddressResolver {
         val v4 = parseAddresses(v4Response, DNS_TYPE_A)
         if (v4.isNotEmpty()) return v4
 
-        val v6Response = runCatching { post(endpoint, queryV6, inFlight) }.getOrNull() ?: return null
+        val v6Response = runCatching { post(endpoint, queryV6, inFlight) }.getOrNull() ?: return emptyList()
         return parseAddresses(v6Response, DNS_TYPE_AAAA)
     }
 

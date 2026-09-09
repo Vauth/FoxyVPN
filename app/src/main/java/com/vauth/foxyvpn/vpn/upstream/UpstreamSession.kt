@@ -13,6 +13,8 @@ interface UpstreamSession : Closeable {
 
     fun disableNewStreamsAndCloseWhenIdle()
 
+    fun updateBearerToken(token: String)
+
     val isConnected: Boolean
 }
 

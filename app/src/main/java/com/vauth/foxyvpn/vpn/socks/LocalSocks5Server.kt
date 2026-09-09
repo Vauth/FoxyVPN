@@ -38,17 +38,21 @@ private const val HANDSHAKE_TIMEOUT_MS = 10_000
 
 private const val HALF_CLOSE_DRAIN_TIMEOUT_MS = 2 * 60_000L
 
-private const val MAX_CONCURRENT_CLIENT_CONNECTIONS = 128
+private const val MAX_CONCURRENT_CLIENT_CONNECTIONS = 512
 
-private const val ACCEPT_BACKLOG = 128
+private const val ACCEPT_BACKLOG = 256
 
 private const val ACCEPT_ERROR_BACKOFF_MS = 100L
 
-private const val RELAY_BUFFER_BYTES = 16 * 1024
+private const val RELAY_BUFFER_BYTES = 32 * 1024
 
 private const val FAILURE_SUMMARY_INTERVAL_MS = 15_000L
 
 private const val UNREACHABLE_TARGET_TTL_MS = 30_000L
+
+private const val UNREACHABLE_TARGET_TTL_CAP_MS = 10 * 60_000L
+
+private const val REFUSALS_BEFORE_TREATING_AS_POLICY = 3
 
 private const val UNREACHABLE_TARGET_CACHE_CAP = 256
 
@@ -80,20 +84,32 @@ class LocalSocks5Server(
     private val localNetworkRejections = AtomicInteger(0)
     private val cachedRefusalRejections = AtomicInteger(0)
 
+    private val declinedDestinations = AtomicInteger(0)
+
     private val sessionAuthRejections = AtomicInteger(0)
 
     @Volatile private var unauthenticatedSession: UpstreamSession? = null
 
     private val health = UpstreamHealthTracker()
 
-    private val unreachableTargets = object : LinkedHashMap<String, Long>(64, 0.75f, false) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>): Boolean =
+    private class RefusalRecord {
+
+        var strikes: Int = 0
+
+        var expiresAt: Long = 0L
+    }
+
+    private val unreachableTargets = object : LinkedHashMap<String, RefusalRecord>(64, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, RefusalRecord>): Boolean =
             size > UNREACHABLE_TARGET_CACHE_CAP
     }
 
     fun start() {
 
-        val server = ServerSocket(port, ACCEPT_BACKLOG, InetAddress.getByName(bindAddress))
+        val server = ServerSocket()
+
+        runCatching { server.reuseAddress = true }
+        server.bind(InetSocketAddress(InetAddress.getByName(bindAddress), port), ACCEPT_BACKLOG)
         serverSocket = server
         scope.launch {
             while (!server.isClosed) {
@@ -152,12 +168,21 @@ class LocalSocks5Server(
                     "session (they were never sent through the tunnel)",
             )
         }
+
         val cached = cachedRefusalRejections.getAndSet(0)
         if (cached > 0) {
-            AppLogger.i(
+            AppLogger.d(
                 TAG,
                 "$cached connection(s) were refused immediately during this session because the edge had " +
                     "recently refused the same destination (saving one round trip each)",
+            )
+        }
+        val declined = declinedDestinations.getAndSet(0)
+        if (declined > 0) {
+            AppLogger.d(
+                TAG,
+                "$declined connection(s) were declined by the edge during this session (destinations it " +
+                    "does not proxy, such as non-web ports; an edge policy, not a tunnel fault)",
             )
         }
         val unauthenticated = sessionAuthRejections.getAndSet(0)
@@ -186,8 +211,13 @@ class LocalSocks5Server(
         }
     }
 
-    private fun recordUpstreamFailure(target: String, cause: Throwable?) {
+    private fun recordUpstreamFailure(target: String, cause: Throwable?, declinedByEdge: Boolean = false) {
         AppLogger.d(TAG, "opening upstream stream failed for $target: ${cause?.message ?: "timed out"}")
+
+        if (declinedByEdge) {
+            declinedDestinations.incrementAndGet()
+            return
+        }
         upstreamFailures.incrementAndGet()
         val now = System.currentTimeMillis()
         val since = lastFailureSummaryAt.get()
@@ -253,8 +283,6 @@ class LocalSocks5Server(
             val cmd = input.readUnsignedByte()
             input.readUnsignedByte() 
 
-            socket.soTimeout = 0
-
             when (cmd) {
                 0x01 -> handleConnect(socket, input, output)
                 0x03 -> handleUdpAssociate(socket, input, output)
@@ -273,6 +301,8 @@ class LocalSocks5Server(
             output.flush()
             return
         }
+
+        socket.soTimeout = 0
         val targetHost = target.host
         val targetPort = target.port
         val targetKey = "$targetHost:$targetPort"
@@ -332,9 +362,11 @@ class LocalSocks5Server(
         if (tunneled == null) {
 
             val cause = tunnelResult.exceptionOrNull()
-            recordUpstreamFailure(targetKey, cause)
 
-            if (shouldRememberRefusal(cause)) rememberUnreachable(targetKey)
+            val declinedByEdge = shouldRememberRefusal(cause)
+            if (declinedByEdge) rememberUnreachable(targetKey, targetPort)
+
+            recordUpstreamFailure(targetKey, cause, declinedByEdge = declinedByEdge)
 
             when (health.observeFailure(targetKey, cause)) {
                 UpstreamHealthTracker.Verdict.TARGET_FAILURE -> Unit
@@ -370,6 +402,8 @@ class LocalSocks5Server(
         }
 
         health.observeSuccess()
+
+        forgetUnreachable(targetKey)
 
         if (unauthenticatedSession != null && session !== unauthenticatedSession) {
             unauthenticatedSession = null
@@ -432,9 +466,18 @@ class LocalSocks5Server(
         val relay = runCatching {
             Socks5UdpDnsRelay(
                 socket.localAddress,
+
+                socket.inetAddress,
                 InetSocketAddress(socket.localAddress, port),
                 sessionProvider,
-            ) { runCatching { socket.close() } }
+            ) {
+
+                AppLogger.d(
+                    TAG,
+                    "a UDP association carried traffic this tunnel cannot relay; the association was kept " +
+                        "open for DNS and the unsupported datagrams were dropped",
+                )
+            }
         }.getOrNull()
         if (relay == null) {
             output.write(socksReply(0x01)) 
@@ -447,6 +490,7 @@ class LocalSocks5Server(
             output.write(socksReply(0x00, relay.boundAddress, relay.boundPort))
             output.flush()
 
+            socket.soTimeout = 0
             val drain = ByteArray(64)
             while (true) {
                 val read = runCatching { input.read(drain) }.getOrDefault(-1)
@@ -534,17 +578,34 @@ class LocalSocks5Server(
     }
 
     private fun isKnownUnreachable(key: String): Boolean = synchronized(unreachableTargets) {
-        val expiresAt = unreachableTargets[key] ?: return false
-        if (System.currentTimeMillis() >= expiresAt) {
-            unreachableTargets.remove(key)
-            return false
-        }
-        return true
+
+        val record = unreachableTargets[key] ?: return false
+        return System.currentTimeMillis() < record.expiresAt
     }
 
-    private fun rememberUnreachable(key: String) {
+    private fun rememberUnreachable(key: String, targetPort: Int): Int = synchronized(unreachableTargets) {
+        val record = unreachableTargets.getOrPut(key) { RefusalRecord() }
+        record.strikes += 1
+
+        val backoffMs = (UNREACHABLE_TARGET_TTL_MS shl (record.strikes - 1).coerceAtMost(16))
+            .coerceAtMost(UNREACHABLE_TARGET_TTL_CAP_MS)
+        record.expiresAt = System.currentTimeMillis() + backoffMs
+        if (record.strikes == REFUSALS_BEFORE_TREATING_AS_POLICY) {
+            AppLogger.d(
+                TAG,
+                "the edge has refused $key ${record.strikes} times in a row; it does not appear to proxy " +
+                    "port $targetPort, so further attempts will be refused on-device with an increasing " +
+                    "backoff (up to ${UNREACHABLE_TARGET_TTL_CAP_MS / 1_000}s) instead of costing a round trip",
+            )
+        }
+        return record.strikes
+    }
+
+    private fun forgetUnreachable(key: String) {
         synchronized(unreachableTargets) {
-            unreachableTargets[key] = System.currentTimeMillis() + UNREACHABLE_TARGET_TTL_MS
+            if (unreachableTargets.remove(key) != null) {
+                AppLogger.d(TAG, "$key succeeded; clearing its refusal backoff")
+            }
         }
     }
 

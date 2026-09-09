@@ -27,9 +27,19 @@ object HevSocks5TunnelConfig {
 
     private const val TCP_READ_WRITE_TIMEOUT_MS = 300_000
 
-    private const val UDP_READ_WRITE_TIMEOUT_MS = 15_000
+    private const val UDP_READ_WRITE_TIMEOUT_MS = 60_000
 
     private const val TCP_BUFFER_SIZE_BYTES = 65_536
+
+    private const val TASK_STACK_SIZE_BYTES = 86_016
+
+    private const val UDP_RECV_BUFFER_SIZE_BYTES = 524_288
+
+    private const val UDP_COPY_BUFFER_NUMS = 16
+
+    private const val MAX_SESSION_COUNT = 0
+
+    private const val LIMIT_NOFILE = 65_535
 
     fun isFakeDnsAddress(host: String): Boolean {
         val parts = host.split('.')
@@ -71,10 +81,15 @@ object HevSocks5TunnelConfig {
             """.trimIndent() + "\n" + mapdnsBlock +
             """
             misc:
+              task-stack-size: $TASK_STACK_SIZE_BYTES
               connect-timeout: $CONNECT_TIMEOUT_MS
               tcp-read-write-timeout: $TCP_READ_WRITE_TIMEOUT_MS
               udp-read-write-timeout: $UDP_READ_WRITE_TIMEOUT_MS
               tcp-buffer-size: $TCP_BUFFER_SIZE_BYTES
+              udp-recv-buffer-size: $UDP_RECV_BUFFER_SIZE_BYTES
+              udp-copy-buffer-nums: $UDP_COPY_BUFFER_NUMS
+              max-session-count: $MAX_SESSION_COUNT
+              limit-nofile: $LIMIT_NOFILE
               log-level: 'warn'
             """.trimIndent() + "\n"
 

@@ -8,8 +8,10 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -202,7 +204,7 @@ class FoxyVpnService : VpnService() {
         val previous = boundNetwork
         if (previous == network) return
 
-        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return
+        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) && previous != null) return
         boundNetwork = network
         runCatching { ControlPlaneHttp.client.connectionPool.evictAll() }
         if (previous == null) return
@@ -243,7 +245,13 @@ class FoxyVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         runCatching {
-            getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(networkCallback)
+
+            val underlyingNetworks = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            getSystemService(ConnectivityManager::class.java)
+                ?.registerNetworkCallback(underlyingNetworks, networkCallback)
         }.onFailure { AppLogger.w(TAG, "could not register a network callback; handovers will be slower to detect", it) }
     }
 
@@ -289,14 +297,18 @@ class FoxyVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action
+
+        val action = intent?.action ?: ACTION_CONNECT
         if (action == ACTION_CONNECT || action == VpnService.SERVICE_INTERFACE) {
 
             if (_state.value != ConnectionState.DISCONNECTED) {
                 AppLogger.d(TAG, "ignoring duplicate connect request while ${_state.value}")
 
                 enterForeground(statusLabel)
-                return START_NOT_STICKY
+                return START_STICKY
+            }
+            if (intent == null) {
+                AppLogger.i(TAG, "the service was restarted by the system; bringing the tunnel back up")
             }
             _state.value = ConnectionState.CONNECTING
             _lastError.value = null
@@ -305,6 +317,8 @@ class FoxyVpnService : VpnService() {
 
             acquireWakeLocks()
             connectJob = scope.launch { opMutex.withLock { connect() } }
+
+            return START_STICKY
         } else if (action == ACTION_DISCONNECT) {
             requestDisconnect("requested by the user")
         }
@@ -353,12 +367,26 @@ class FoxyVpnService : VpnService() {
         }
     }
 
-    private fun hasUsableNetwork(): Boolean {
-        val manager = getSystemService(ConnectivityManager::class.java) ?: return true
+    private fun firstUsableNetwork(): Network? {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return null
+        @Suppress("DEPRECATION")
+        val networks = runCatching { manager.allNetworks }.getOrDefault(emptyArray())
+        var unvalidated: Network? = null
+        for (network in networks) {
+            val capabilities = manager.getNetworkCapabilities(network) ?: continue
 
-        val active = manager.activeNetwork ?: return false
-        val capabilities = manager.getNetworkCapabilities(active) ?: return false
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return network
+            if (unvalidated == null) unvalidated = network
+        }
+        return unvalidated
+    }
+
+    private fun hasUsableNetwork(): Boolean {
+
+        getSystemService(ConnectivityManager::class.java) ?: return true
+        return firstUsableNetwork() != null
     }
 
     private fun isFatalUpstreamError(error: Throwable): Boolean =
@@ -367,7 +395,7 @@ class FoxyVpnService : VpnService() {
     private fun startProxyPassRenewal(
         myGeneration: Int,
         initialExpiry: Long?,
-        dialNewSession: suspend () -> Pair<com.vauth.foxyvpn.vpn.upstream.H2UpstreamSession, Long?>,
+        mintProxyPass: suspend () -> ProxyPass,
     ) {
         tokenRenewalJob?.cancel()
         tokenRenewalJob = scope.launch {
@@ -387,9 +415,9 @@ class FoxyVpnService : VpnService() {
                     continue
                 }
 
-                val attempt = runCatching { dialNewSession() }
-                val result = attempt.getOrNull()
-                if (result == null) {
+                val attempt = runCatching { mintProxyPass() }
+                val pass = attempt.getOrNull()
+                if (pass == null) {
                     val error = attempt.exceptionOrNull()
                     if (error is CancellationException) throw error
                     if (error != null && isFatalUpstreamError(error)) {
@@ -407,20 +435,28 @@ class FoxyVpnService : VpnService() {
                     continue
                 }
 
-                val (newSession, newExpiry) = result
+                if (myGeneration != connectionGeneration) return@launch
 
-                if (myGeneration != connectionGeneration) {
-                    runCatching { newSession.close() }
-                    return@launch
+                val live = upstreamSession
+                if (live == null || !live.isConnected) {
+
+                    AppLogger.d(
+                        TAG,
+                        "minted a fresh proxy pass but the session went down meanwhile; the watchdog's redial " +
+                            "will mint its own",
+                    )
+                    expiry = pass.expiresAtEpochSeconds
+                    continue
                 }
 
-                val oldSession = upstreamSession
-                upstreamSession = newSession
-                AppLogger.i(TAG, "proxy pass renewed; established a new HTTP/2 tunnel and swapped it into the live session")
-                
-                oldSession?.disableNewStreamsAndCloseWhenIdle()
-                
-                expiry = newExpiry
+                val lifetimeNote = pass.expiresAtEpochSeconds?.let { expiresAt ->
+                    val seconds = (expiresAt * 1_000L - System.currentTimeMillis()) / 1_000L
+                    " (valid for ${seconds}s)"
+                } ?: " (lifetime not stated)"
+                live.updateBearerToken(pass.token)
+                AppLogger.i(TAG, "proxy pass renewed in place$lifetimeNote; the tunnel was not rebuilt")
+
+                expiry = pass.expiresAtEpochSeconds
             }
         }
     }
@@ -557,9 +593,8 @@ class FoxyVpnService : VpnService() {
 
                 reportedUnderlying = null
                 runCatching {
-                    getSystemService(ConnectivityManager::class.java)?.activeNetwork?.let { active ->
-                        reportUnderlyingNetwork(active)
-                    }
+
+                    firstUsableNetwork()?.let { underlying -> reportUnderlyingNetwork(underlying) }
                 }
 
                 val tunnelConfigPath = HevSocks5TunnelConfig.write(
@@ -721,7 +756,7 @@ class FoxyVpnService : VpnService() {
             updateNotification(connectedText)
             AppLogger.i(TAG, "connect: CONNECTED via ${establishedCandidate.authority}")
 
-            startProxyPassRenewal(myGeneration, currentPassExpiry) { dialUpstream() }
+            startProxyPassRenewal(myGeneration, currentPassExpiry) { mintProxyPass() }
 
             if (settingsStore.exitCheckEnabled) {
                 scope.launch {
@@ -842,7 +877,7 @@ class FoxyVpnService : VpnService() {
                     updateNotification(statusLabel)
                     AppLogger.i(TAG, "upstream tunnel reconnected via ${activeCandidate().authority}")
 
-                    startProxyPassRenewal(myGeneration, currentPassExpiry) { dialUpstream() }
+                    startProxyPassRenewal(myGeneration, currentPassExpiry) { mintProxyPass() }
                 }
             }
         }.onFailure { failure ->
@@ -944,25 +979,35 @@ class FoxyVpnService : VpnService() {
                 }.onFailure {
                     AppLogger.w(
                         TAG,
-                        "could not add an IPv6 address to the TUN interface; continuing IPv4-only " +
-                            "(IPv6 traffic will not be routed into the tunnel)",
+                        "could not add an IPv6 address to the TUN interface; IPv6 will be captured by the " +
+                            "tunnel's default route and dropped rather than sent in the clear",
                         it,
                     )
                 }
-                if (ipv6Address.isSuccess) {
-                    runCatching { addRoute("::", 0) }.onFailure {
-                        AppLogger.w(
-                            TAG,
-                            "added an IPv6 address but could not route ::/0; IPv6 traffic will bypass the tunnel",
-                            it,
-                        )
-                    }
+
+                runCatching { addRoute("::", 0) }.onFailure {
+                    AppLogger.e(
+                        TAG,
+                        "could not claim the IPv6 default route; IPv6 traffic may bypass the tunnel and leak " +
+                            "the device's real address",
+                        it,
+                    )
+                }
+                if (ipv6Address.isFailure) {
+                    AppLogger.i(TAG, "establishTun: IPv6 is routed into the tunnel and blackholed (no IPv6 address)")
                 }
             }
             .addDnsServer(dnsServer)
 
             .setMtu(HevSocks5TunnelConfig.TUN_MTU)
             .setBlocking(true)
+            .apply {
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    runCatching { setMetered(false) }
+                        .onFailure { AppLogger.d(TAG, "could not mark the tunnel as unmetered: ${it.message}") }
+                }
+            }
             .apply {
                 runCatching { addDisallowedApplication(packageName) }
                     .onFailure { AppLogger.w(TAG, "failed to exclude own app from the VPN tunnel", it) }
@@ -1108,7 +1153,12 @@ class FoxyVpnService : VpnService() {
         }
 
         fun stop(context: Context) {
-            context.startService(Intent(context, FoxyVpnService::class.java).setAction(ACTION_DISCONNECT))
+
+            val intent = Intent(context, FoxyVpnService::class.java).setAction(ACTION_DISCONNECT)
+            runCatching { context.startService(intent) }
+                .onFailure {
+                    AppLogger.w(TAG, "could not deliver the disconnect intent; the service is not running", it)
+                }
         }
     }
 }

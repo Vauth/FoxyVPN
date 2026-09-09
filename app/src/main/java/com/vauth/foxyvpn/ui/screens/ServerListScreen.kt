@@ -19,6 +19,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
@@ -42,6 +43,8 @@ private sealed class LocationRow {
     data class CityRow(val country: VpnCountry, val cityIndex: Int) : LocationRow()
 }
 
+private enum class PingState { PENDING, DONE, FAILED }
+
 @Composable
 fun ServerListScreen(
     serverListClient: ServerListClient,
@@ -54,6 +57,9 @@ fun ServerListScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
     val selectedState by proxyStateStore.selectedProxyFlow.collectAsState()
+
+    val pingResults = remember { mutableStateMapOf<String, Int>() }
+    val pingStates = remember { mutableStateMapOf<String, PingState>() }
 
     LaunchedEffect(Unit) {
         runCatching { serverListClient.fetchCountries() }
@@ -99,7 +105,17 @@ fun ServerListScreen(
                     modifier = Modifier.align(Alignment.Center).padding(24.dp),
                 )
                 else -> LazyColumn {
-                    items(rows) { row ->
+                    items(
+                        rows,
+                        key = { row ->
+                            when (row) {
+                                is LocationRow.RecommendedRow -> "recommended:${row.country.code}"
+                                is LocationRow.CountryHeader -> "country:${row.country.code}"
+                                is LocationRow.CityRow ->
+                                    "city:${row.country.code}:${row.country.cities[row.cityIndex].code}"
+                            }
+                        },
+                    ) { row ->
 
                         val selected = selectedState
                         when (row) {
@@ -132,17 +148,25 @@ fun ServerListScreen(
                                 val city = row.country.cities[row.cityIndex]
                                 val serverCount = city.servers.size
 
-                                var pingMs by remember(row.country.code, city.code) { mutableStateOf<Int?>(null) }
-                                var pingFailed by remember(row.country.code, city.code) { mutableStateOf(false) }
-                                LaunchedEffect(row.country.code, city.code) {
+                                val pingKey = "${row.country.code}:${city.code}"
+                                val pingMs = pingResults[pingKey]
+                                val pingState = pingStates[pingKey] ?: PingState.PENDING
+
+                                LaunchedEffect(pingKey) {
+                                    if (pingStates.containsKey(pingKey)) return@LaunchedEffect
                                     val target = city.servers.firstOrNull { !it.quarantined }
                                         ?.let { ServerListClient.defaultConnectTarget(it) }
                                     if (target == null) {
-                                        pingFailed = true
+                                        pingStates[pingKey] = PingState.FAILED
                                         return@LaunchedEffect
                                     }
                                     val result = PingUtil.measureTcpLatencyMs(target.first, target.second)
-                                    if (result != null) pingMs = result else pingFailed = true
+                                    if (result != null) {
+                                        pingResults[pingKey] = result
+                                        pingStates[pingKey] = PingState.DONE
+                                    } else {
+                                        pingStates[pingKey] = PingState.FAILED
+                                    }
                                 }
 
                                 ListItem(
@@ -157,7 +181,7 @@ fun ServerListScreen(
                                         }
                                         val pingLabel = when {
                                             pingMs != null -> "$pingMs ms"
-                                            pingFailed -> "ping unavailable"
+                                            pingState == PingState.FAILED -> "ping unavailable"
                                             else -> "pinging\u2026"
                                         }
                                         Text("$serverLabel \u2022 $pingLabel")

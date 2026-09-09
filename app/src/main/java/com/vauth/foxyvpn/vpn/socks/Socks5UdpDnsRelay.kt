@@ -35,6 +35,8 @@ private const val QUERY_TIMEOUT_MS = 10_000L
 
 internal class Socks5UdpDnsRelay(
     private val bindAddress: InetAddress,
+
+    private val clientAddress: InetAddress,
     private val socksProxy: InetSocketAddress?,
     private val sessionProvider: () -> UpstreamSession?,
     private val onUnsupportedFlow: () -> Unit = {},
@@ -48,6 +50,7 @@ internal class Socks5UdpDnsRelay(
     private val queriesOverTcp = AtomicInteger(0)
     private val httpsFallbacks = AtomicInteger(0)
     private val nonDnsDropped = AtomicInteger(0)
+    private val foreignSourceDropped = AtomicInteger(0)
     private val otherDropped = AtomicInteger(0)
     private val unsupportedFlowReported = AtomicBoolean(false)
 
@@ -70,6 +73,18 @@ internal class Socks5UdpDnsRelay(
                     socket.receive(packet)
                 } catch (e: IOException) {
                     break 
+                }
+
+                if (packet.address != clientAddress) {
+
+                    if (foreignSourceDropped.getAndIncrement() == 0) {
+                        AppLogger.w(
+                            TAG,
+                            "dropping a datagram from ${packet.address}: this association belongs to " +
+                                "$clientAddress, and relaying for anyone else would make this an open resolver",
+                        )
+                    }
+                    continue
                 }
 
                 val datagram = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
@@ -97,14 +112,15 @@ internal class Socks5UdpDnsRelay(
         val tcp = queriesOverTcp.get()
         val fallbacks = httpsFallbacks.get()
         val nonDns = nonDnsDropped.get()
+        val foreign = foreignSourceDropped.get()
         val other = otherDropped.get()
 
-        if (https > 0 || tcp > 0 || nonDns > 0 || other > 0) {
+        if (https > 0 || tcp > 0 || nonDns > 0 || foreign > 0 || other > 0) {
             AppLogger.d(
                 TAG,
                 "UDP association closed: $https DNS queries over HTTPS, $tcp over plaintext TCP " +
                     "($fallbacks of them after HTTPS failed), $nonDns non-DNS datagrams dropped, " +
-                    "$other other drops",
+                    "$foreign from unassociated sources, $other other drops",
             )
         }
     }
@@ -118,11 +134,13 @@ internal class Socks5UdpDnsRelay(
         if (request.port != DNS_PORT) {
 
             nonDnsDropped.incrementAndGet()
+
             if (unsupportedFlowReported.compareAndSet(false, true)) {
                 AppLogger.d(
                     TAG,
-                    "refusing UDP association: first datagram targets port ${request.port}, not DNS " +
-                        "(this tunnel carries no general UDP, so the app is told now rather than left waiting)",
+                    "dropping a datagram for port ${request.port}: this tunnel carries TCP only, so general " +
+                        "UDP (QUIC included) cannot be relayed and the sender has to fall back to TCP. " +
+                        "The DNS association stays up.",
                 )
                 runCatching { onUnsupportedFlow() }
             }

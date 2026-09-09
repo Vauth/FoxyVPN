@@ -12,6 +12,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
 
+private const val TAG = "ControlPlaneHttp"
+
 const val MOZILLA_VPN_USER_AGENT = "MozillaVPN/2.35.0 (sys:linux; iap:true)"
 
 fun Request.Builder.applyMozillaVpnHeaders(): Request.Builder {
@@ -66,30 +68,43 @@ class SimpleCookieJar : CookieJar {
 }
 
 private class ProtectingSocketFactory : SocketFactory() {
-    private fun protect(socket: Socket): Socket {
-        ControlPlaneHttp.socketProtector?.invoke(socket)
+
+    private fun protect(socket: Socket, localAddress: InetSocketAddress?): Socket {
+
+        runCatching {
+            if (!socket.isBound) socket.bind(localAddress ?: InetSocketAddress(0))
+        }.onFailure {
+            AppLogger.w(TAG, "could not bind a control-plane socket before protecting it", it)
+        }
+        val protector = ControlPlaneHttp.socketProtector
+        if (protector != null) {
+            val protectedOk = runCatching { protector.invoke(socket) }.getOrDefault(false)
+            if (!protectedOk) {
+                AppLogger.w(
+                    TAG,
+                    "VpnService.protect() refused a control-plane socket; this request would be routed " +
+                        "back into the tunnel instead of out to the network",
+                )
+            }
+        }
         return socket
     }
 
-    override fun createSocket(): Socket = protect(Socket())
+    override fun createSocket(): Socket = protect(Socket(), null)
 
     override fun createSocket(host: String, port: Int): Socket =
-        protect(Socket()).apply { connect(InetSocketAddress(host, port)) }
+        protect(Socket(), null).apply { connect(InetSocketAddress(host, port)) }
 
     override fun createSocket(host: String, port: Int, localAddr: InetAddress, localPort: Int): Socket =
-        protect(Socket()).apply {
-            bind(InetSocketAddress(localAddr, localPort))
-            connect(InetSocketAddress(host, port))
-        }
+        protect(Socket(), InetSocketAddress(localAddr, localPort))
+            .apply { connect(InetSocketAddress(host, port)) }
 
     override fun createSocket(host: InetAddress, port: Int): Socket =
-        protect(Socket()).apply { connect(InetSocketAddress(host, port)) }
+        protect(Socket(), null).apply { connect(InetSocketAddress(host, port)) }
 
     override fun createSocket(host: InetAddress, port: Int, localAddr: InetAddress, localPort: Int): Socket =
-        protect(Socket()).apply {
-            bind(InetSocketAddress(localAddr, localPort))
-            connect(InetSocketAddress(host, port))
-        }
+        protect(Socket(), InetSocketAddress(localAddr, localPort))
+            .apply { connect(InetSocketAddress(host, port)) }
 }
 
 object ControlPlaneHttp {

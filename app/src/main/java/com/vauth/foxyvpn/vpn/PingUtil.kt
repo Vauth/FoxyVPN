@@ -14,6 +14,7 @@ object PingUtil {
             runCatching {
                 val start = System.nanoTime()
                 Socket().use { socket ->
+                    socket.bind(InetSocketAddress(0))
                     com.vauth.foxyvpn.data.ControlPlaneHttp.socketProtector?.invoke(socket)
                     socket.connect(InetSocketAddress(host, port), TIMEOUT_MS)
                 }
