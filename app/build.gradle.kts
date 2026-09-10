@@ -47,8 +47,8 @@ android {
         applicationId = "com.vauth.foxyvpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 39
-        versionName = "1.0.2"
+        versionCode = 40
+        versionName = "1.0.3"
 
         externalNativeBuild {
             ndkBuild {

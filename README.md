@@ -2,6 +2,16 @@
 
 # FoxyVPN - Unofficial Firefox VPN client
 
+<p align="center">
+  <img src="https://i.ibb.co/8D9KdmNk/6a07263d16c0.png" alt="FoxyVPN Logo" width="150"/>
+</p>
+
+![Android](https://img.shields.io/badge/Android-212121?style=for-the-badge&logo=android&logoColor=white)
+![Kotlin](https://img.shields.io/badge/Kotlin-212121?style=for-the-badge&logo=kotlin&logoColor=white)
+![Compose](https://img.shields.io/badge/Jetpack%20Compose-212121?style=for-the-badge&logo=android&logoColor=white)
+![License](https://img.shields.io/badge/License_MIT-212121?style=for-the-badge)
+
+
 *FoxyVPN signs in with a Firefox account, obtains a proxy pass from Mozilla's
 Guardian service, and carries the whole device's traffic through Firefox VPN's
 Fastly edge over an HTTP/2 tunnel. It is a native Kotlin app with a
@@ -78,8 +88,8 @@ gradle :app:assembleRelease --no-daemon
 ### 📝 To-Do List
 The project is on test phase so not much yet.
 - [x] Improve stability.
+- [x] Better Logo.
 - [ ] HTTP/3 implementation (Not Planned Yet).
-- [ ] Better Logo.
 
 <br>
 
