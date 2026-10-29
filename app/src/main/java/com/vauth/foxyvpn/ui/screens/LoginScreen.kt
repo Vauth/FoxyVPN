@@ -67,11 +67,21 @@ fun LoginScreen(
     }
 
     fun startBrowserLogin() {
-        if (completingBrowserLogin) return
+        if (completingBrowserLogin || isLoading) return
         errorMessage = null
-        val flow = FxaAuthRepository.createBrowserLoginFlow()
-        browserStartUrl = flow.startUrl
-        browserVerifier = flow.codeVerifier
+        isLoading = true
+        scope.launch {
+            // The flow must be started by the app's own HTTP client so Guardian's
+            // flow session cookie lands in the shared cookie jar used by the final
+            // /login/verify call (the official client does the same).
+            authRepository.startBrowserLoginFlow()
+                .onSuccess { flow ->
+                    browserStartUrl = flow.startUrl
+                    browserVerifier = flow.codeVerifier
+                }
+                .onFailure { errorMessage = it.message ?: "Could not start the browser sign-in" }
+            isLoading = false
+        }
     }
 
     fun handleBrowserCode(authCode: String) {

@@ -76,17 +76,19 @@ class FxaAuthRepository(
         tokenStore.pendingSessionToken = null
     }
 
-    companion object {
-        /**
-         * Build the browser sign-in flow exactly like the official client does: a PKCE
-         * pair plus the Guardian login URL that redirects to accounts.firefox.com. The
-         * WebView/system browser passes (and automatically solves) the Fastly bot
-         * challenges that block direct API password sign-in with HTTP 406.
-         */
-        fun createBrowserLoginFlow(): BrowserLoginFlow {
+    /**
+     * Start the browser sign-in flow exactly like the official client does: the app
+     * itself GETs the Guardian login URL (so Guardian's flow session cookie lands in
+     * the shared cookie jar) and builds the accounts.firefox.com authorization URL
+     * from the returned JSON. The browser only handles the actual sign-in; the final
+     * /login/verify call must present the same flow session, otherwise Guardian
+     * rejects the code with "'code' not found or expired".
+     */
+    suspend fun startBrowserLoginFlow(): Result<BrowserLoginFlow> = withContext(Dispatchers.IO) {
+        runCatching {
             val verifier = generatePkceVerifier()
             val challenge = pkceS256Challenge(verifier)
-            val url = "$GUARDIAN_LOGIN_BASE$GUARDIAN_LOGIN_PATH".toHttpUrl().newBuilder()
+            val startUrl = "$GUARDIAN_LOGIN_BASE$GUARDIAN_LOGIN_PATH".toHttpUrl().newBuilder()
                 .addQueryParameter("code_challenge", challenge)
                 .addQueryParameter("code_challenge_method", "S256")
                 .addQueryParameter("user_agent", MOZILLA_VPN_USER_AGENT)
@@ -94,9 +96,48 @@ class FxaAuthRepository(
                 .addQueryParameter("utm_source", "android-customtab-flow")
                 .addQueryParameter("iap", "true")
                 .build()
-            return BrowserLoginFlow(startUrl = url.toString(), codeVerifier = verifier)
-        }
 
+            fun buildStartRequest(): Request =
+                Request.Builder().url(startUrl).applyMozillaVpnHeaders().build()
+
+            var response = ControlPlaneHttp.client.newCall(buildStartRequest()).execute()
+            var attempts = 1
+            while (response.code == 406 && attempts < FXA_MAX_CHALLENGE_ATTEMPTS) {
+                val challengedBody = response.use { it.body?.string().orEmpty() }
+                try {
+                    challengeSolver.solveAndInstall(challengedBody, GUARDIAN_LOGIN_BASE)
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (solveFailure: Exception) {
+                    AppLogger.w(TAG, "could not solve the Fastly challenge", solveFailure)
+                    throw FastlyBlockedException(FRIENDLY_406_MESSAGE, solveFailure)
+                }
+                response = ControlPlaneHttp.client.newCall(buildStartRequest()).execute()
+                attempts++
+            }
+
+            response.use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (resp.code >= 400) {
+                    throw FxaApiError(
+                        "could not start the sign-in flow: HTTP ${resp.code}",
+                        null,
+                        resp.code,
+                    )
+                }
+                // Response shape: {"fxa_oauth":{"url":"https://accounts.firefox.com/authorization","params":{...}}}
+                val fxa = JSONObject(text).optJSONObject("fxa_oauth")
+                    ?: error("The sign-in service returned an unexpected response")
+                val authorizationUrl = fxa.optString("url", "https://accounts.firefox.com/authorization")
+                val params = fxa.optJSONObject("params") ?: JSONObject()
+                val builder = authorizationUrl.toHttpUrl().newBuilder()
+                for (key in params.keys()) builder.addQueryParameter(key, params.optString(key))
+                BrowserLoginFlow(startUrl = builder.build().toString(), codeVerifier = verifier)
+            }
+        }
+    }
+
+    companion object {
         private fun generatePkceVerifier(): String {
             // Same alphabet and length as the official client.
             val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
@@ -145,9 +186,11 @@ class FxaAuthRepository(
 
     /**
      * Finish the browser sign-in: exchange the OAuth code captured from the redirect
-     * for a Guardian session token, mirroring the official client's login/verify call.
-     * The stored session is a Guardian JWT (no FxA refresh token is involved in this
-     * flow), so it stays valid until the JWT expires and re-login happens via browser.
+     * for a Guardian session token. The shared cookie jar still holds the flow session
+     * cookie created by [startBrowserLoginFlow], which Guardian requires to match the
+     * code against the PKCE challenge. The stored session is a Guardian JWT (no FxA
+     * refresh token is involved in this flow), so it stays valid until the JWT expires
+     * and re-login happens via browser.
      */
     suspend fun completeBrowserLogin(code: String, codeVerifier: String): Result<Unit> = runCatching {
         val cleanCode = sanitizeCode(code)
