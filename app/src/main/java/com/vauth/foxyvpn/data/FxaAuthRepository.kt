@@ -43,10 +43,26 @@ private const val STRETCHED_PW_LEN = 32
 private const val HKDF_LEN = 32
 private const val VERIFICATION_METHOD_EMAIL_2FA = "email-2fa"
 private const val FXA_ERRNO_INVALID_PARAMETER = 107
-private const val FXA_MAX_CHALLENGE_ATTEMPTS = 5
+private const val FXA_MAX_CHALLENGE_ATTEMPTS = 3
 private const val DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
 
+// The Guardian (vpn.mozilla.org) browser-login endpoints, mirroring the official
+// Mozilla VPN client: it opens the login URL in a browser and finishes the flow by
+// posting the authorization code plus PKCE verifier to /api/v2/vpn/login/verify.
+private const val GUARDIAN_LOGIN_BASE = "https://vpn.mozilla.org"
+private const val GUARDIAN_LOGIN_PATH = "/api/v2/vpn/login/android"
+private const val GUARDIAN_LOGIN_VERIFY_PATH = "/api/v2/vpn/login/verify"
+
 private val jsonMediaType = "application/json".toMediaType()
+
+/** Raised when Mozilla's bot protection (Fastly) rejects the request and the challenge cannot be solved. */
+class FastlyBlockedException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/** PKCE pair + start URL for the browser sign-in flow. */
+data class BrowserLoginFlow(
+    val startUrl: String,
+    val codeVerifier: String,
+)
 
 class FxaAuthRepository(
     private val tokenStore: TokenStore,
@@ -61,6 +77,41 @@ class FxaAuthRepository(
     }
 
     companion object {
+        /**
+         * Build the browser sign-in flow exactly like the official client does: a PKCE
+         * pair plus the Guardian login URL that redirects to accounts.firefox.com. The
+         * WebView/system browser passes (and automatically solves) the Fastly bot
+         * challenges that block direct API password sign-in with HTTP 406.
+         */
+        fun createBrowserLoginFlow(): BrowserLoginFlow {
+            val verifier = generatePkceVerifier()
+            val challenge = pkceS256Challenge(verifier)
+            val url = "$GUARDIAN_LOGIN_BASE$GUARDIAN_LOGIN_PATH".toHttpUrl().newBuilder()
+                .addQueryParameter("code_challenge", challenge)
+                .addQueryParameter("code_challenge_method", "S256")
+                .addQueryParameter("user_agent", MOZILLA_VPN_USER_AGENT)
+                .addQueryParameter("utm_medium", "vpn-client")
+                .addQueryParameter("utm_source", "android-customtab-flow")
+                .addQueryParameter("iap", "true")
+                .build()
+            return BrowserLoginFlow(startUrl = url.toString(), codeVerifier = verifier)
+        }
+
+        private fun generatePkceVerifier(): String {
+            // Same alphabet and length as the official client.
+            val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+            val bytes = ByteArray(128).also { SecureRandom().nextBytes(it) }
+            return buildString(128) {
+                for (b in bytes) append(alphabet[b.toInt().and(0xFF) % alphabet.length])
+            }
+        }
+
+        private fun pkceS256Challenge(verifier: String): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(verifier.toByteArray(Charsets.US_ASCII))
+            return Base64.encodeToString(digest, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+        }
+
         fun normalizeEmail(email: String): String =
             email.replace(Regex("[\\p{Z}\\u200B-\\u200D\\uFEFF\\u00A0\\s]+"), "").trim().lowercase()
 
@@ -91,6 +142,62 @@ class FxaAuthRepository(
         clearPendingSession()
         false
     }
+
+    /**
+     * Finish the browser sign-in: exchange the OAuth code captured from the redirect
+     * for a Guardian session token, mirroring the official client's login/verify call.
+     * The stored session is a Guardian JWT (no FxA refresh token is involved in this
+     * flow), so it stays valid until the JWT expires and re-login happens via browser.
+     */
+    suspend fun completeBrowserLogin(code: String, codeVerifier: String): Result<Unit> = runCatching {
+        val cleanCode = sanitizeCode(code)
+        if (cleanCode.isBlank()) error("The sign-in flow did not return an authorization code")
+        val body = JSONObject()
+            .put("code", cleanCode)
+            .put("code_verifier", codeVerifier)
+        val data = guardianDo("POST", GUARDIAN_LOGIN_VERIFY_PATH, body)
+        val token = data.optString("token", "").takeIf { it.isNotBlank() }
+            ?: error("The sign-in service did not return a session token")
+        val expiresAt = jwtExpiryEpochSeconds(token)
+            ?: (System.currentTimeMillis() / 1000 + DEFAULT_ACCESS_TOKEN_TTL_SECONDS)
+        tokenStore.saveAuth(
+            RuntimeAuth(
+                accessToken = token,
+                refreshToken = null,
+                expiresAtEpochSeconds = expiresAt,
+            ),
+        )
+        clearPendingSession()
+    }
+
+    private suspend fun guardianDo(method: String, path: String, jsonBody: JSONObject): JSONObject =
+        withContext(Dispatchers.IO) {
+            val url = "$GUARDIAN_LOGIN_BASE$path".toHttpUrl()
+            val bodyBytes = jsonBody.toString().toByteArray(Charsets.UTF_8)
+            val request = Request.Builder().url(url).applyMozillaVpnHeaders()
+                .header("Content-Type", "application/json")
+                .method(method, bodyBytes.toRequestBody(jsonMediaType))
+                .build()
+            ControlPlaneHttp.client.newCall(request).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (resp.code >= 400) {
+                    val errorBody = try {
+                        JSONObject(text)
+                    } catch (e: Exception) {
+                        JSONObject()
+                    }
+                    val message = when {
+                        errorBody.length() > 0 ->
+                            errorBody.optString("message", errorBody.optString("error", "HTTP ${resp.code}"))
+                        text.isEmpty() -> "HTTP ${resp.code}"
+                        else -> text.take(200)
+                    }
+                    val errno = if (errorBody.has("errno")) errorBody.optInt("errno") else null
+                    throw FxaApiError(message, errno, resp.code)
+                }
+                if (text.isEmpty()) JSONObject() else JSONObject(text)
+            }
+        }
 
     suspend fun restoreSession(): SessionStatus {
         val stored = runCatching { tokenStore.loadAuth() }.getOrNull()
@@ -246,6 +353,7 @@ class FxaAuthRepository(
         jsonBody: JSONObject,
     ): JSONObject = withContext(Dispatchers.IO) {
         val url = "$FXA_AUTH_SERVER$path".toHttpUrl()
+        val origin = "${url.scheme}://${url.host}"
         val bodyBytes = jsonBody.toString().toByteArray(Charsets.UTF_8)
         var tokenId: String? = null
         var hmacKey: ByteArray? = null
@@ -268,8 +376,15 @@ class FxaAuthRepository(
         var response: Response = ControlPlaneHttp.client.newCall(buildRequest()).execute()
         var attempts = 1
         while (response.code == 406 && attempts < FXA_MAX_CHALLENGE_ATTEMPTS) {
-            response.close()
-            challengeSolver.solveAndInstall()
+            val challengedBody = response.use { it.body?.string().orEmpty() }
+            try {
+                challengeSolver.solveAndInstall(challengedBody, origin)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (solveFailure: Exception) {
+                AppLogger.w(TAG, "could not solve the Fastly challenge", solveFailure)
+                throw FastlyBlockedException(FRIENDLY_406_MESSAGE, solveFailure)
+            }
             response = ControlPlaneHttp.client.newCall(buildRequest()).execute()
             attempts++
         }
@@ -277,13 +392,22 @@ class FxaAuthRepository(
         response.use { resp ->
             val text = resp.body?.string().orEmpty()
             if (resp.code >= 400) {
+                if (resp.code == 406) {
+                    // A still-challenged response is never a normal API error; do not
+                    // dump its HTML (or an opaque "HTTP 406") into the UI.
+                    throw FastlyBlockedException(FRIENDLY_406_MESSAGE)
+                }
                 val errorBody = try {
                     JSONObject(text)
                 } catch (e: Exception) {
                     JSONObject()
                 }
                 val errno = if (errorBody.has("errno")) errorBody.optInt("errno") else null
-                val message = errorBody.optString("message", text.ifEmpty { "HTTP ${resp.code}" })
+                val message = when {
+                    errorBody.length() > 0 -> errorBody.optString("message", "HTTP ${resp.code}")
+                    text.isEmpty() -> "HTTP ${resp.code}"
+                    else -> text.take(200)
+                }
                 throw FxaApiError(message, errno, resp.code)
             }
             if (text.isEmpty()) return@withContext JSONObject()
@@ -332,6 +456,11 @@ class FxaAuthRepository(
         return header
     }
 }
+
+private const val FRIENDLY_406_MESSAGE =
+    "Mozilla's bot protection rejected this request (HTTP 406) and the automatic " +
+        "challenge could not be completed on this network. Use “Sign in with browser” " +
+        "on the login screen, or switch networks (Wi-Fi <-> mobile data) and retry."
 
 private fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
     val mac = Mac.getInstance("HmacSHA256")

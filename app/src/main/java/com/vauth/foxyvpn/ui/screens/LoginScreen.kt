@@ -17,9 +17,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,6 +52,10 @@ fun LoginScreen(
     var awaitingTwoFactor by rememberSaveable { mutableStateOf(authRepository.pendingSessionToken != null) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by rememberSaveable { mutableStateOf<String?>(null) }
+    var showLegacyLogin by rememberSaveable { mutableStateOf(false) }
+    var browserStartUrl by rememberSaveable { mutableStateOf<String?>(null) }
+    var browserVerifier by rememberSaveable { mutableStateOf<String?>(null) }
+    var completingBrowserLogin by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
 
@@ -58,6 +64,36 @@ fun LoginScreen(
         awaitingTwoFactor = false
         errorMessage = null
         code = ""
+    }
+
+    fun startBrowserLogin() {
+        if (completingBrowserLogin) return
+        errorMessage = null
+        val flow = FxaAuthRepository.createBrowserLoginFlow()
+        browserStartUrl = flow.startUrl
+        browserVerifier = flow.codeVerifier
+    }
+
+    fun handleBrowserCode(authCode: String) {
+        val verifier = browserVerifier ?: return
+        if (completingBrowserLogin) return
+        completingBrowserLogin = true
+        errorMessage = null
+        scope.launch {
+            val result = authRepository.completeBrowserLogin(authCode, verifier)
+            completingBrowserLogin = false
+            result.onSuccess {
+                browserStartUrl = null
+                browserVerifier = null
+                onSignedIn()
+            }.onFailure {
+                // Captured codes are single-use; drop the flow so the next attempt
+                // starts fresh with a new PKCE pair.
+                browserStartUrl = null
+                browserVerifier = null
+                errorMessage = it.message ?: "Browser sign-in failed"
+            }
+        }
     }
 
     fun doSubmitLogin() {
@@ -92,6 +128,20 @@ fun LoginScreen(
         }
     }
 
+    if (browserStartUrl != null && browserVerifier != null) {
+        BrowserLoginScreen(
+            startUrl = browserStartUrl!!,
+            busy = completingBrowserLogin,
+            onCodeCaptured = ::handleBrowserCode,
+            onCanceled = {
+                browserStartUrl = null
+                browserVerifier = null
+                completingBrowserLogin = false
+            },
+        )
+        return
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -116,6 +166,41 @@ fun LoginScreen(
             Spacer(Modifier.padding(top = 24.dp))
 
             if (!awaitingTwoFactor) {
+                Button(
+                    onClick = { startBrowserLogin() },
+                    enabled = !completingBrowserLogin && !isLoading,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (completingBrowserLogin) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    } else {
+                        Text("Sign in with browser")
+                    }
+                }
+                Text(
+                    "Recommended: opens the official Mozilla sign-in page in an in-app browser, which avoids the HTTP 406 bot-protection error.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+
+                Spacer(Modifier.padding(top = 20.dp))
+                HorizontalDivider()
+                Spacer(Modifier.padding(top = 8.dp))
+                TextButton(
+                    onClick = { showLegacyLogin = !showLegacyLogin },
+                    enabled = !completingBrowserLogin,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (showLegacyLogin) "Hide email & password sign-in" else "Use email & password instead")
+                }
+            }
+
+            if (showLegacyLogin && !awaitingTwoFactor) {
                 OutlinedTextField(
                     value = email,
                     onValueChange = {
@@ -173,7 +258,7 @@ fun LoginScreen(
                         Text("Continue")
                     }
                 }
-            } else {
+            } else if (awaitingTwoFactor) {
                 Text("Enter the confirmation code sent to your email", style = MaterialTheme.typography.bodyMedium)
                 Spacer(Modifier.padding(top = 12.dp))
                 OutlinedTextField(
