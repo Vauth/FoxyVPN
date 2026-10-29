@@ -35,6 +35,10 @@ class FxaRefreshFailure(
 ) : Exception(message, cause)
 
 private const val FXA_AUTH_SERVER = "https://api.accounts.firefox.com/v1"
+// The OAuth token server is a separate deployment from the auth server: the
+// refresh_token grant lives here (no HAWK signature needed), while the
+// fxa-credentials grant lives on the auth server above.
+private const val FXA_OAUTH_SERVER = "https://oauth.accounts.firefox.com/v1"
 private const val FIREFOX_CLIENT_ID = "5882386c6d801776"
 private const val OAUTH_SCOPE = "profile https://identity.mozilla.com/apps/vpn"
 private const val PROTOCOL_VERSION = "identity.mozilla.com/picl/v1/"
@@ -46,22 +50,25 @@ private const val FXA_ERRNO_INVALID_PARAMETER = 107
 private const val FXA_MAX_CHALLENGE_ATTEMPTS = 3
 private const val DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
 
-// The Guardian (vpn.mozilla.org) browser-login endpoints, mirroring the official
-// Mozilla VPN client: it opens the login URL in a browser and finishes the flow by
-// posting the authorization code plus PKCE verifier to /api/v2/vpn/login/verify.
-private const val GUARDIAN_LOGIN_BASE = "https://vpn.mozilla.org"
-private const val GUARDIAN_LOGIN_PATH = "/api/v2/vpn/login/android"
-private const val GUARDIAN_LOGIN_VERIFY_PATH = "/api/v2/vpn/login/verify"
+/**
+ * The sync-style sign-in entry point (the same flow Firefox desktop uses to
+ * connect an account). The accounts.firefox.com page hands the session token to
+ * the host browser over the WebChannel bridge (command "fxaccounts:login"); our
+ * in-app WebView intercepts that message, and the app then mints an FxA OAuth
+ * token locally with the fxa-credentials grant — the only token type Guardian's
+ * /api/v1/fpn proxy endpoints accept.
+ */
+private const val WEBCHANNEL_LOGIN_URL =
+    "https://accounts.firefox.com/?context=fx_desktop_v3&service=sync&action=email"
 
 private val jsonMediaType = "application/json".toMediaType()
 
 /** Raised when Mozilla's bot protection (Fastly) rejects the request and the challenge cannot be solved. */
 class FastlyBlockedException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
-/** PKCE pair + start URL for the browser sign-in flow. */
+/** Start URL for the in-app browser sign-in flow. */
 data class BrowserLoginFlow(
     val startUrl: String,
-    val codeVerifier: String,
 )
 
 class FxaAuthRepository(
@@ -77,82 +84,15 @@ class FxaAuthRepository(
     }
 
     /**
-     * Start the browser sign-in flow exactly like the official client does: the app
-     * itself GETs the Guardian login URL (so Guardian's flow session cookie lands in
-     * the shared cookie jar) and builds the accounts.firefox.com authorization URL
-     * from the returned JSON. The browser only handles the actual sign-in; the final
-     * /login/verify call must present the same flow session, otherwise Guardian
-     * rejects the code with "'code' not found or expired".
+     * Start the browser sign-in flow: a plain accounts.firefox.com sync sign-in
+     * whose session token the in-app WebView receives over the WebChannel bridge
+     * (see [BrowserLoginScreen]). No network round trip is needed to start it.
      */
-    suspend fun startBrowserLoginFlow(): Result<BrowserLoginFlow> = withContext(Dispatchers.IO) {
-        runCatching {
-            val verifier = generatePkceVerifier()
-            val challenge = pkceS256Challenge(verifier)
-            val startUrl = "$GUARDIAN_LOGIN_BASE$GUARDIAN_LOGIN_PATH".toHttpUrl().newBuilder()
-                .addQueryParameter("code_challenge", challenge)
-                .addQueryParameter("code_challenge_method", "S256")
-                .addQueryParameter("user_agent", MOZILLA_VPN_USER_AGENT)
-                .addQueryParameter("utm_medium", "vpn-client")
-                .addQueryParameter("utm_source", "android-customtab-flow")
-                .addQueryParameter("iap", "true")
-                .build()
-
-            fun buildStartRequest(): Request =
-                Request.Builder().url(startUrl).applyMozillaVpnHeaders().build()
-
-            var response = ControlPlaneHttp.client.newCall(buildStartRequest()).execute()
-            var attempts = 1
-            while (response.code == 406 && attempts < FXA_MAX_CHALLENGE_ATTEMPTS) {
-                val challengedBody = response.use { it.body?.string().orEmpty() }
-                try {
-                    challengeSolver.solveAndInstall(challengedBody, GUARDIAN_LOGIN_BASE)
-                } catch (cancellation: CancellationException) {
-                    throw cancellation
-                } catch (solveFailure: Exception) {
-                    AppLogger.w(TAG, "could not solve the Fastly challenge", solveFailure)
-                    throw FastlyBlockedException(FRIENDLY_406_MESSAGE, solveFailure)
-                }
-                response = ControlPlaneHttp.client.newCall(buildStartRequest()).execute()
-                attempts++
-            }
-
-            response.use { resp ->
-                val text = resp.body?.string().orEmpty()
-                if (resp.code >= 400) {
-                    throw FxaApiError(
-                        "could not start the sign-in flow: HTTP ${resp.code}",
-                        null,
-                        resp.code,
-                    )
-                }
-                // Response shape: {"fxa_oauth":{"url":"https://accounts.firefox.com/authorization","params":{...}}}
-                val fxa = JSONObject(text).optJSONObject("fxa_oauth")
-                    ?: error("The sign-in service returned an unexpected response")
-                val authorizationUrl = fxa.optString("url", "https://accounts.firefox.com/authorization")
-                val params = fxa.optJSONObject("params") ?: JSONObject()
-                val builder = authorizationUrl.toHttpUrl().newBuilder()
-                for (key in params.keys()) builder.addQueryParameter(key, params.optString(key))
-                BrowserLoginFlow(startUrl = builder.build().toString(), codeVerifier = verifier)
-            }
-        }
+    suspend fun startBrowserLoginFlow(): Result<BrowserLoginFlow> = runCatching {
+        BrowserLoginFlow(startUrl = WEBCHANNEL_LOGIN_URL)
     }
 
     companion object {
-        private fun generatePkceVerifier(): String {
-            // Same alphabet and length as the official client.
-            val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-            val bytes = ByteArray(128).also { SecureRandom().nextBytes(it) }
-            return buildString(128) {
-                for (b in bytes) append(alphabet[b.toInt().and(0xFF) % alphabet.length])
-            }
-        }
-
-        private fun pkceS256Challenge(verifier: String): String {
-            val digest = MessageDigest.getInstance("SHA-256")
-                .digest(verifier.toByteArray(Charsets.US_ASCII))
-            return Base64.encodeToString(digest, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-        }
-
         fun normalizeEmail(email: String): String =
             email.replace(Regex("[\\p{Z}\\u200B-\\u200D\\uFEFF\\u00A0\\s]+"), "").trim().lowercase()
 
@@ -185,66 +125,32 @@ class FxaAuthRepository(
     }
 
     /**
-     * Finish the browser sign-in: exchange the OAuth code captured from the redirect
-     * for a Guardian session token. The shared cookie jar still holds the flow session
-     * cookie created by [startBrowserLoginFlow], which Guardian requires to match the
-     * code against the PKCE challenge. The stored session is a Guardian JWT (no FxA
-     * refresh token is involved in this flow), so it stays valid until the JWT expires
-     * and re-login happens via browser.
+     * Finish the browser sign-in: the in-app WebView captured the account's session
+     * token from the WebChannel "fxaccounts:login" message. Mint an FxA OAuth token
+     * with the fxa-credentials grant (the same grant and client the reference
+     * clients use) so Guardian's FPN proxy endpoints accept it, and store both the
+     * access and the refresh token.
      */
-    suspend fun completeBrowserLogin(code: String, codeVerifier: String): Result<Unit> = runCatching {
-        val cleanCode = sanitizeCode(code)
-        if (cleanCode.isBlank()) error("The sign-in flow did not return an authorization code")
-        val body = JSONObject()
-            .put("code", cleanCode)
-            .put("code_verifier", codeVerifier)
-        val data = guardianDo("POST", GUARDIAN_LOGIN_VERIFY_PATH, body)
-        val token = data.optString("token", "").takeIf { it.isNotBlank() }
-            ?: error("The sign-in service did not return a session token")
-        val expiresAt = jwtExpiryEpochSeconds(token)
-            ?: (System.currentTimeMillis() / 1000 + DEFAULT_ACCESS_TOKEN_TTL_SECONDS)
-        tokenStore.saveAuth(
-            RuntimeAuth(
-                accessToken = token,
-                refreshToken = null,
-                expiresAtEpochSeconds = expiresAt,
-            ),
-        )
-        clearPendingSession()
-    }
-
-    private suspend fun guardianDo(method: String, path: String, jsonBody: JSONObject): JSONObject =
-        withContext(Dispatchers.IO) {
-            val url = "$GUARDIAN_LOGIN_BASE$path".toHttpUrl()
-            val bodyBytes = jsonBody.toString().toByteArray(Charsets.UTF_8)
-            val request = Request.Builder().url(url).applyMozillaVpnHeaders()
-                .header("Content-Type", "application/json")
-                .method(method, bodyBytes.toRequestBody(jsonMediaType))
-                .build()
-            ControlPlaneHttp.client.newCall(request).execute().use { resp ->
-                val text = resp.body?.string().orEmpty()
-                if (resp.code >= 400) {
-                    val errorBody = try {
-                        JSONObject(text)
-                    } catch (e: Exception) {
-                        JSONObject()
-                    }
-                    val message = when {
-                        errorBody.length() > 0 ->
-                            errorBody.optString("message", errorBody.optString("error", "HTTP ${resp.code}"))
-                        text.isEmpty() -> "HTTP ${resp.code}"
-                        else -> text.take(200)
-                    }
-                    val errno = if (errorBody.has("errno")) errorBody.optInt("errno") else null
-                    throw FxaApiError(message, errno, resp.code)
-                }
-                if (text.isEmpty()) JSONObject() else JSONObject(text)
-            }
+    suspend fun completeBrowserLogin(sessionToken: String): Result<Unit> = runCatching {
+        val clean = sessionToken.trim().replace(Regex("[\\s\"]"), "").lowercase()
+        if (!Regex("^[0-9a-f]{64}$").matches(clean)) {
+            error("The sign-in page did not hand over a usable session token")
         }
+        completeLogin(clean)
+    }
 
     suspend fun restoreSession(): SessionStatus {
         val stored = runCatching { tokenStore.loadAuth() }.getOrNull()
             ?: return SessionStatus.NEEDS_LOGIN
+        if (stored.accessToken.count { it == '.' } == 2) {
+            // A JWT-shaped access token can only come from the retired Guardian
+            // browser-login flow (/api/v2/vpn/login/verify). Guardian's FPN proxy
+            // endpoints reject it with 401, so keep the UI honest and ask for a
+            // fresh sign-in instead of pretending the session is usable.
+            AppLogger.w(TAG, "stored session is a retired Guardian login token; signing out")
+            runCatching { tokenStore.clear() }
+            return SessionStatus.NEEDS_LOGIN
+        }
         if (stored.refreshToken == null && !tokenStore.hasValidAccessToken()) {
             runCatching { tokenStore.clear() }
             return SessionStatus.NEEDS_LOGIN
@@ -289,8 +195,10 @@ class FxaAuthRepository(
             put("scope", OAUTH_SCOPE)
         }
 
+        // The refresh grant is served by the dedicated OAuth token server, not by
+        // the HAWK-authenticated auth server (which answers 401 errno 110 for it).
         val tokenData = try {
-            fxaDo("POST", "/oauth/token", jsonBody = body)
+            oauthServerDo("POST", "/oauth/token", jsonBody = body)
         } catch (rejected: FxaApiError) {
             throw FxaRefreshFailure(
                 rejected.message ?: "FxA rejected the refresh token",
@@ -388,6 +296,62 @@ class FxaAuthRepository(
         }
         return fxaDo("POST", "/oauth/token", sessionToken = sessionToken, jsonBody = body)
     }
+
+    /**
+     * JSON call to the OAuth token server (oauth.accounts.firefox.com). Unlike the
+     * auth server, no HAWK signature is involved; the Fastly anti-bot challenge
+     * handling is identical.
+     */
+    private suspend fun oauthServerDo(method: String, path: String, jsonBody: JSONObject): JSONObject =
+        withContext(Dispatchers.IO) {
+            val url = "$FXA_OAUTH_SERVER$path".toHttpUrl()
+            val origin = "${url.scheme}://${url.host}"
+            val bodyBytes = jsonBody.toString().toByteArray(Charsets.UTF_8)
+
+            fun buildRequest(): Request =
+                Request.Builder().url(url).applyMozillaVpnHeaders()
+                    .header("Content-Type", "application/json")
+                    .method(method, bodyBytes.toRequestBody(jsonMediaType))
+                    .build()
+
+            var response: Response = ControlPlaneHttp.client.newCall(buildRequest()).execute()
+            var attempts = 1
+            while (response.code == 406 && attempts < FXA_MAX_CHALLENGE_ATTEMPTS) {
+                val challengedBody = response.use { it.body?.string().orEmpty() }
+                try {
+                    challengeSolver.solveAndInstall(challengedBody, origin)
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (solveFailure: Exception) {
+                    AppLogger.w(TAG, "could not solve the Fastly challenge", solveFailure)
+                    throw FastlyBlockedException(FRIENDLY_406_MESSAGE, solveFailure)
+                }
+                response = ControlPlaneHttp.client.newCall(buildRequest()).execute()
+                attempts++
+            }
+
+            response.use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (resp.code >= 400) {
+                    if (resp.code == 406) {
+                        throw FastlyBlockedException(FRIENDLY_406_MESSAGE)
+                    }
+                    val errorBody = try {
+                        JSONObject(text)
+                    } catch (e: Exception) {
+                        JSONObject()
+                    }
+                    val errno = if (errorBody.has("errno")) errorBody.optInt("errno") else null
+                    val message = when {
+                        errorBody.length() > 0 -> errorBody.optString("message", "HTTP ${resp.code}")
+                        text.isEmpty() -> "HTTP ${resp.code}"
+                        else -> text.take(200)
+                    }
+                    throw FxaApiError(message, errno, resp.code)
+                }
+                if (text.isEmpty()) JSONObject() else JSONObject(text)
+            }
+        }
 
     private suspend fun fxaDo(
         method: String,

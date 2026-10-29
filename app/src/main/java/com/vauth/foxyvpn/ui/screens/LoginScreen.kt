@@ -54,7 +54,6 @@ fun LoginScreen(
     var errorMessage by rememberSaveable { mutableStateOf<String?>(null) }
     var showLegacyLogin by rememberSaveable { mutableStateOf(false) }
     var browserStartUrl by rememberSaveable { mutableStateOf<String?>(null) }
-    var browserVerifier by rememberSaveable { mutableStateOf<String?>(null) }
     var completingBrowserLogin by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
@@ -69,47 +68,28 @@ fun LoginScreen(
     fun startBrowserLogin() {
         if (completingBrowserLogin || isLoading) return
         errorMessage = null
-        isLoading = true
         scope.launch {
-            // The flow must be started by the app's own HTTP client so Guardian's
-            // flow session cookie lands in the shared cookie jar used by the final
-            // /login/verify call (the official client does the same).
             authRepository.startBrowserLoginFlow()
-                .onSuccess { flow ->
-                    // Copy Guardian's flow session cookie into the WebView cookie
-                    // store: the /oauth/success completion page must carry it, or
-                    // Guardian cannot register the authorization code and the final
-                    // verify call fails with "'code' not found or expired".
-                    syncGuardianCookiesToWebView()
-                    browserStartUrl = flow.startUrl
-                    browserVerifier = flow.codeVerifier
-                }
+                .onSuccess { flow -> browserStartUrl = flow.startUrl }
                 .onFailure { errorMessage = it.message ?: "Could not start the browser sign-in" }
             isLoading = false
         }
     }
 
-    fun handleBrowserCode(authCode: String) {
-        val verifier = browserVerifier ?: return
+    fun handleBrowserSession(sessionToken: String) {
         if (completingBrowserLogin) return
         completingBrowserLogin = true
         errorMessage = null
         scope.launch {
-            // Mirror whatever cookies the WebView ended up with for vpn.mozilla.org
-            // (Guardian may have rotated the flow session while serving the
-            // completion page) into the shared jar used by the verify call.
-            syncWebViewCookiesToGuardianJar()
-            val result = authRepository.completeBrowserLogin(authCode, verifier)
+            val result = authRepository.completeBrowserLogin(sessionToken)
             completingBrowserLogin = false
             result.onSuccess {
                 browserStartUrl = null
-                browserVerifier = null
+                errorMessage = null
                 onSignedIn()
             }.onFailure {
-                // Captured codes are single-use; drop the flow so the next attempt
-                // starts fresh with a new PKCE pair.
-                browserStartUrl = null
-                browserVerifier = null
+                // Keep the sign-in page open so the error stays visible and the
+                // user can simply sign in again for a fresh session token.
                 errorMessage = it.message ?: "Browser sign-in failed"
             }
         }
@@ -147,15 +127,16 @@ fun LoginScreen(
         }
     }
 
-    if (browserStartUrl != null && browserVerifier != null) {
+    if (browserStartUrl != null) {
         BrowserLoginScreen(
             startUrl = browserStartUrl!!,
             busy = completingBrowserLogin,
-            onCodeCaptured = ::handleBrowserCode,
+            errorMessage = errorMessage,
+            onSessionCaptured = ::handleBrowserSession,
             onCanceled = {
                 browserStartUrl = null
-                browserVerifier = null
                 completingBrowserLogin = false
+                errorMessage = null
             },
         )
         return
@@ -201,7 +182,7 @@ fun LoginScreen(
                     }
                 }
                 Text(
-                    "Recommended: opens the official Mozilla sign-in page in an in-app browser, which avoids the HTTP 406 bot-protection error.",
+                    "Recommended: opens the official Mozilla sign-in page in an in-app browser and returns automatically once you are signed in.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 6.dp),
