@@ -76,6 +76,11 @@ fun LoginScreen(
             // /login/verify call (the official client does the same).
             authRepository.startBrowserLoginFlow()
                 .onSuccess { flow ->
+                    // Copy Guardian's flow session cookie into the WebView cookie
+                    // store: the /oauth/success completion page must carry it, or
+                    // Guardian cannot register the authorization code and the final
+                    // verify call fails with "'code' not found or expired".
+                    syncGuardianCookiesToWebView()
                     browserStartUrl = flow.startUrl
                     browserVerifier = flow.codeVerifier
                 }
@@ -90,6 +95,10 @@ fun LoginScreen(
         completingBrowserLogin = true
         errorMessage = null
         scope.launch {
+            // Mirror whatever cookies the WebView ended up with for vpn.mozilla.org
+            // (Guardian may have rotated the flow session while serving the
+            // completion page) into the shared jar used by the verify call.
+            syncWebViewCookiesToGuardianJar()
             val result = authRepository.completeBrowserLogin(authCode, verifier)
             completingBrowserLogin = false
             result.onSuccess {
