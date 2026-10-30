@@ -161,7 +161,7 @@ private val WEBCHANNEL_HOOK_JS = """
 })();
 """.trimIndent()
 
-private class WebChannelBridge(
+internal class WebChannelBridge(
     webView: WebView,
     private val onSessionToken: (String) -> Unit,
 ) {

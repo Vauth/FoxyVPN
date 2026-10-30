@@ -21,6 +21,8 @@
 
 -dontwarn reactor.blockhound.**
 
+-keepattributes JavascriptInterface, *Annotation*
+
 -keep class com.vauth.foxyvpn.ui.screens.WebChannelBridge { *; }
 -keepclassmembers class * {
     @android.webkit.JavascriptInterface <methods>;
