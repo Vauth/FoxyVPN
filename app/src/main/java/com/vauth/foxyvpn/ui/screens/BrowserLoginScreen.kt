@@ -40,7 +40,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.vauth.foxyvpn.data.AppLogger
 import java.lang.ref.WeakReference
-import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 private const val TAG = "BrowserLogin"
@@ -86,16 +85,22 @@ private val WEBCHANNEL_HOOK_JS = """
       document.dispatchEvent(eventStr);
     } catch (e) {}
   };
+  var getUrlString = function(arg) {
+    if (!arg) return '';
+    if (typeof arg === 'string') return arg;
+    if (typeof arg.url === 'string') return arg.url;
+    if (typeof arg.href === 'string') return arg.href;
+    try { return arg.toString(); } catch (e) { return ''; }
+  };
   var checkVerifyUrl = function(url) {
-    if (typeof url !== 'string') return false;
-    var u = url.toLowerCase();
-    return u.indexOf('/verify') !== -1 || u.indexOf('/totp') !== -1 || u.indexOf('/session') !== -1;
+    var u = getUrlString(url).toLowerCase();
+    return u.indexOf('/verify') !== -1 || u.indexOf('/totp') !== -1 || u.indexOf('/session/verify') !== -1;
   };
   var checkSuccessUrl = function(url) {
-    if (typeof url !== 'string') return false;
-    var u = url.toLowerCase();
+    var u = getUrlString(url).toLowerCase();
     return u.indexOf('confirmed') !== -1 || u.indexOf('connect_another_device') !== -1 ||
-           u.indexOf('/pair') !== -1 || u.indexOf('/settings') !== -1 || u.indexOf('/complete') !== -1;
+           u.indexOf('/pair') !== -1 || u.indexOf('/settings') !== -1 || u.indexOf('/complete') !== -1 ||
+           u.indexOf('success') !== -1;
   };
   if (window.fetch) {
     var origFetch = window.fetch;
@@ -215,19 +220,16 @@ private class WebChannelBridge(
                     reply(messageId, command, """{"ok":true}""")
                 }
             }
-            "fxaccounts:email_verified", "fxaccounts:session_verified", "fxaccounts:verified" -> {
-                val token = data.optString("sessionToken", "").trim()
-                    .ifBlank { data.optString("token", "").trim() }
-                    .ifBlank { pendingSessionToken ?: "" }
-                if (SESSION_TOKEN_HEX.matches(token)) {
-                    pendingSessionToken = token
-                    notifySessionToken(token)
-                }
-                if (messageId.isNotBlank()) {
-                    reply(messageId, command, """{"ok":true}""")
-                }
-            }
             else -> {
+                if (command.contains("verified", ignoreCase = true)) {
+                    val token = data.optString("sessionToken", "").trim()
+                        .ifBlank { data.optString("token", "").trim() }
+                        .ifBlank { pendingSessionToken ?: "" }
+                    if (SESSION_TOKEN_HEX.matches(token)) {
+                        pendingSessionToken = token
+                        notifySessionToken(token)
+                    }
+                }
                 if (messageId.isNotBlank()) {
                     reply(messageId, command, """{"ok":true}""")
                 }
@@ -263,7 +265,8 @@ private fun isSuccessUrl(url: String?): Boolean {
         u.contains("/connect_another_device") ||
         u.contains("/pair") ||
         u.contains("/settings") ||
-        u.contains("/complete")
+        u.contains("/complete") ||
+        u.contains("success")
 }
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -296,16 +299,6 @@ fun BrowserLoginScreen(
         currentOnSession(token)
     }
 
-    LaunchedEffect(bridgeInstance?.pendingSessionToken, busy) {
-        val pendingToken = bridgeInstance?.pendingSessionToken
-        if (pendingToken != null && !busy) {
-            delay(4000)
-            if (!busy) {
-                handleSession(pendingToken)
-            }
-        }
-    }
-
     Column(
         Modifier
             .fillMaxSize()
@@ -317,7 +310,7 @@ fun BrowserLoginScreen(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(end = 16.dp),
+                .padding(start = 4.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
         ) {
             IconButton(
                 onClick = {
