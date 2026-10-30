@@ -61,17 +61,26 @@ private val WEBCHANNEL_HOOK_JS = """
     try {
       var host = window.location.hostname;
       if (host !== 'accounts.firefox.com' && !host.endsWith('.firefox.com')) return;
-      foxyWebChannel.onMessage(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      var payload = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      foxyWebChannel.onMessage(payload, window.location.href);
     } catch (e) {}
   };
   window.addEventListener('WebChannelMessageToChrome', function (e) { forward(e.detail); });
   document.addEventListener('WebChannelMessageToChrome', function (e) { forward(e.detail); });
   window.__foxyReply = function (channelId, messageId, command, dataJson) {
-    var envelope = {
-      id: channelId,
-      message: { messageId: messageId, command: command, data: JSON.parse(dataJson) }
-    };
-    window.dispatchEvent(new CustomEvent('WebChannelMessageToContent', { detail: JSON.stringify(envelope) }));
+    try {
+      var parsedData = typeof dataJson === 'string' ? JSON.parse(dataJson) : dataJson;
+      var envelope = {
+        id: channelId,
+        message: { messageId: messageId, command: command, data: parsedData }
+      };
+      var eventObj = new CustomEvent('WebChannelMessageToContent', { detail: envelope });
+      window.dispatchEvent(eventObj);
+      document.dispatchEvent(eventObj);
+      var eventStr = new CustomEvent('WebChannelMessageToContent', { detail: JSON.stringify(envelope) });
+      window.dispatchEvent(eventStr);
+      document.dispatchEvent(eventStr);
+    } catch (e) {}
   };
 })();
 """.trimIndent()
@@ -84,9 +93,13 @@ private class WebChannelBridge(
 
     @JavascriptInterface
     fun onMessage(payload: String) {
-        val view = webViewRef.get() ?: return
-        val currentHost = runCatching { Uri.parse(view.url).host?.lowercase() }.getOrNull()
-        if (currentHost != "accounts.firefox.com" && currentHost?.endsWith(".firefox.com") != true) {
+        onMessage(payload, "https://accounts.firefox.com")
+    }
+
+    @JavascriptInterface
+    fun onMessage(payload: String, originUrl: String) {
+        val host = runCatching { Uri.parse(originUrl).host?.lowercase() }.getOrNull()
+        if (host != "accounts.firefox.com" && host?.endsWith(".firefox.com") != true) {
             return
         }
         val message = runCatching {
@@ -107,10 +120,16 @@ private class WebChannelBridge(
                 CMD_CAN_LINK_ACCOUNT,
                 """{"ok":true}""",
             )
-            CMD_LOGIN -> {
+            CMD_LOGIN, "fxaccounts:oauth_login" -> {
                 val token = data.optString("sessionToken", "").trim()
+                    .ifBlank { data.optString("token", "").trim() }
                 if (SESSION_TOKEN_HEX.matches(token)) {
-                    view.post { onSessionToken(token) }
+                    val view = webViewRef.get()
+                    if (view != null) {
+                        view.post { onSessionToken(token) }
+                    } else {
+                        onSessionToken(token)
+                    }
                 }
             }
         }
@@ -222,6 +241,7 @@ fun BrowserLoginScreen(
                         webViewInstance = this
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        settings.databaseEnabled = true
                         settings.loadWithOverviewMode = true
                         settings.useWideViewPort = true
                         settings.userAgentString = FIREFOX_ANDROID_UA
@@ -270,6 +290,11 @@ fun BrowserLoginScreen(
                         webChromeClient = object : WebChromeClient() {
                             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                                 pageProgress = newProgress
+                            }
+
+                            override fun onConsoleMessage(message: android.webkit.ConsoleMessage?): Boolean {
+                                message?.message()?.let { AppLogger.d(TAG, "console: $it") }
+                                return super.onConsoleMessage(message)
                             }
                         }
                         loadUrl(startUrl)
