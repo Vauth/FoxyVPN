@@ -17,7 +17,7 @@ import javax.net.SocketFactory
 
 private const val TAG = "ControlPlaneHttp"
 
-const val MOZILLA_VPN_USER_AGENT = "MozillaVPN/2.35.0 (sys:linux; iap:true)"
+const val MOZILLA_VPN_USER_AGENT = "MozillaVPN/2.35.0 (sys:android 14; iap:true)"
 
 fun Request.Builder.applyMozillaVpnHeaders(): Request.Builder {
     header("User-Agent", MOZILLA_VPN_USER_AGENT)

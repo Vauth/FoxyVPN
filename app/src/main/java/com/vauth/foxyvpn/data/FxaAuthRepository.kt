@@ -12,7 +12,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
-import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.Mac
@@ -28,23 +27,32 @@ enum class SessionStatus {
 
 class FxaApiError(message: String, val errno: Int?, val statusCode: Int?) : Exception(message)
 
+val FxaApiError.isUnconfirmedSession: Boolean
+    get() = errno == 104 || (statusCode == 400 && message?.contains("Unconfirmed session", ignoreCase = true) == true)
+
+fun Throwable.isUnconfirmedSession(): Boolean =
+    (this as? FxaApiError)?.isUnconfirmedSession == true ||
+        message?.contains("Unconfirmed session", ignoreCase = true) == true
+
+
 class FxaRefreshFailure(
     message: String,
     val permanent: Boolean,
     cause: Throwable? = null,
 ) : Exception(message, cause)
 
+class FastlyBlockedException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
 private const val FXA_AUTH_SERVER = "https://api.accounts.firefox.com/v1"
+private const val FXA_OAUTH_SERVER = "https://oauth.accounts.firefox.com/v1"
 private const val FIREFOX_CLIENT_ID = "5882386c6d801776"
 private const val OAUTH_SCOPE = "profile https://identity.mozilla.com/apps/vpn"
 private const val PROTOCOL_VERSION = "identity.mozilla.com/picl/v1/"
-private const val PBKDF2_ROUNDS = 1000
-private const val STRETCHED_PW_LEN = 32
-private const val HKDF_LEN = 32
-private const val VERIFICATION_METHOD_EMAIL_2FA = "email-2fa"
-private const val FXA_ERRNO_INVALID_PARAMETER = 107
-private const val FXA_MAX_CHALLENGE_ATTEMPTS = 5
+private const val FXA_MAX_CHALLENGE_ATTEMPTS = 3
 private const val DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
+
+private const val WEBCHANNEL_LOGIN_URL =
+    "https://accounts.firefox.com/?context=fx_desktop_v3&service=sync&action=email"
 
 private val jsonMediaType = "application/json".toMediaType()
 
@@ -52,44 +60,14 @@ class FxaAuthRepository(
     private val tokenStore: TokenStore,
     private val challengeSolver: FastlyChallengeSolver = FastlyChallengeSolver(ControlPlaneHttp.cookieJar),
 ) {
-    var pendingSessionToken: String?
-        get() = tokenStore.pendingSessionToken
-        set(value) { tokenStore.pendingSessionToken = value }
+    fun getBrowserLoginUrl(): String = WEBCHANNEL_LOGIN_URL
 
-    fun clearPendingSession() {
-        tokenStore.pendingSessionToken = null
-    }
-
-    companion object {
-        fun normalizeEmail(email: String): String =
-            email.replace(Regex("[\\p{Z}\\u200B-\\u200D\\uFEFF\\u00A0\\s]+"), "").trim().lowercase()
-
-        fun sanitizeCode(code: String): String =
-            code.replace(Regex("[\\p{Z}\\u200B-\\u200D\\uFEFF\\u00A0\\s]+"), "").trim()
-    }
-
-    suspend fun startLogin(email: String, password: String): Result<Boolean> = runCatching {
-        val cleanEmail = normalizeEmail(email)
-        val data = loginAttempt(cleanEmail, password)
-        val sessionToken = data.getString("sessionToken")
-        pendingSessionToken = sessionToken
-        val verified = data.optBoolean("verified", false)
-        if (!verified) {
-            true
-        } else {
-            completeLogin(sessionToken)
-            clearPendingSession()
-            false
+    suspend fun completeBrowserLogin(sessionToken: String): Result<Unit> = runCatching {
+        val clean = sessionToken.trim().replace(Regex("[\\s\"]"), "").lowercase()
+        if (!Regex("^[0-9a-f]{64}$").matches(clean)) {
+            error("The sign-in page did not hand over a usable session token")
         }
-    }
-
-    suspend fun submitTwoFactorCode(code: String): Result<Boolean> = runCatching {
-        val cleanCode = sanitizeCode(code)
-        val sessionToken = pendingSessionToken ?: error("No pending FxA session. Start sign-in again.")
-        fxaDo("POST", "/session/verify_code", sessionToken = sessionToken, jsonBody = JSONObject().put("code", cleanCode))
-        completeLogin(sessionToken)
-        clearPendingSession()
-        false
+        completeLogin(clean)
     }
 
     suspend fun restoreSession(): SessionStatus {
@@ -140,7 +118,11 @@ class FxaAuthRepository(
         }
 
         val tokenData = try {
-            fxaDo("POST", "/oauth/token", jsonBody = body)
+            executeFxaRequest(
+                baseUrl = FXA_OAUTH_SERVER,
+                path = "/oauth/token",
+                jsonBody = body,
+            )
         } catch (rejected: FxaApiError) {
             throw FxaRefreshFailure(
                 rejected.message ?: "FxA rejected the refresh token",
@@ -209,24 +191,6 @@ class FxaAuthRepository(
                 expiresAtEpochSeconds = expiryFrom(tokenData),
             ),
         )
-        clearPendingSession()
-    }
-
-    private suspend fun loginAttempt(email: String, password: String, withVerificationMethod: Boolean = true): JSONObject {
-        val body = JSONObject().apply {
-            put("email", email)
-            put("authPW", deriveAuthPw(email, password))
-            if (withVerificationMethod) put("verificationMethod", VERIFICATION_METHOD_EMAIL_2FA)
-        }
-        return try {
-            fxaDo("POST", "/account/login", jsonBody = body)
-        } catch (e: FxaApiError) {
-            if (e.errno == FXA_ERRNO_INVALID_PARAMETER && withVerificationMethod) {
-                loginAttempt(email, password, withVerificationMethod = false)
-            } else {
-                throw e
-            }
-        }
     }
 
     private suspend fun oauthToken(sessionToken: String): JSONObject {
@@ -236,16 +200,23 @@ class FxaAuthRepository(
             put("scope", OAUTH_SCOPE)
             put("access_type", "offline")
         }
-        return fxaDo("POST", "/oauth/token", sessionToken = sessionToken, jsonBody = body)
+        return executeFxaRequest(
+            baseUrl = FXA_AUTH_SERVER,
+            path = "/oauth/token",
+            jsonBody = body,
+            sessionToken = sessionToken,
+        )
     }
 
-    private suspend fun fxaDo(
-        method: String,
+    private suspend fun executeFxaRequest(
+        baseUrl: String,
         path: String,
-        sessionToken: String? = null,
+        method: String = "POST",
         jsonBody: JSONObject,
+        sessionToken: String? = null,
     ): JSONObject = withContext(Dispatchers.IO) {
-        val url = "$FXA_AUTH_SERVER$path".toHttpUrl()
+        val url = "$baseUrl$path".toHttpUrl()
+        val origin = "${url.scheme}://${url.host}"
         val bodyBytes = jsonBody.toString().toByteArray(Charsets.UTF_8)
         var tokenId: String? = null
         var hmacKey: ByteArray? = null
@@ -257,7 +228,7 @@ class FxaAuthRepository(
 
         fun buildRequest(): Request {
             val builder = Request.Builder().url(url).applyMozillaVpnHeaders()
-            builder.header("Content-Type", "application/json")
+                .header("Content-Type", "application/json")
             if (sessionToken != null) {
                 builder.header("Authorization", hawkHeader(method, url, tokenId!!, hmacKey!!, bodyBytes))
             }
@@ -268,8 +239,15 @@ class FxaAuthRepository(
         var response: Response = ControlPlaneHttp.client.newCall(buildRequest()).execute()
         var attempts = 1
         while (response.code == 406 && attempts < FXA_MAX_CHALLENGE_ATTEMPTS) {
-            response.close()
-            challengeSolver.solveAndInstall()
+            val challengedBody = response.use { it.body?.string().orEmpty() }
+            try {
+                challengeSolver.solveAndInstall(challengedBody, origin)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (solveFailure: Exception) {
+                AppLogger.w(TAG, "could not solve the Fastly challenge", solveFailure)
+                throw FastlyBlockedException(FRIENDLY_406_MESSAGE, solveFailure)
+            }
             response = ControlPlaneHttp.client.newCall(buildRequest()).execute()
             attempts++
         }
@@ -277,28 +255,24 @@ class FxaAuthRepository(
         response.use { resp ->
             val text = resp.body?.string().orEmpty()
             if (resp.code >= 400) {
+                if (resp.code == 406) {
+                    throw FastlyBlockedException(FRIENDLY_406_MESSAGE)
+                }
                 val errorBody = try {
                     JSONObject(text)
                 } catch (e: Exception) {
                     JSONObject()
                 }
                 val errno = if (errorBody.has("errno")) errorBody.optInt("errno") else null
-                val message = errorBody.optString("message", text.ifEmpty { "HTTP ${resp.code}" })
+                val message = when {
+                    errorBody.length() > 0 -> errorBody.optString("message", "HTTP ${resp.code}")
+                    text.isEmpty() -> "HTTP ${resp.code}"
+                    else -> text.take(200)
+                }
                 throw FxaApiError(message, errno, resp.code)
             }
-            if (text.isEmpty()) return@withContext JSONObject()
-            return@withContext JSONObject(text)
+            if (text.isEmpty()) JSONObject() else JSONObject(text)
         }
-    }
-
-    private fun deriveQuickStretch(email: String, password: String): ByteArray {
-        val salt = "${PROTOCOL_VERSION}quickStretch:$email".toByteArray(Charsets.UTF_8)
-        return pbkdf2HmacSha256(password.toByteArray(Charsets.UTF_8), salt, PBKDF2_ROUNDS, STRETCHED_PW_LEN)
-    }
-
-    private fun deriveAuthPw(email: String, password: String): String {
-        val quickStretched = deriveQuickStretch(email, password)
-        return hkdf(quickStretched, "${PROTOCOL_VERSION}authPW", HKDF_LEN).toHex()
     }
 
     private fun deriveHawkCredentials(sessionTokenHex: String): Pair<String, ByteArray> {
@@ -333,6 +307,11 @@ class FxaAuthRepository(
     }
 }
 
+private const val FRIENDLY_406_MESSAGE =
+    "Mozilla's bot protection rejected this request (HTTP 406) and the automatic " +
+        "challenge could not be completed on this network. Please switch networks " +
+        "(Wi-Fi <-> mobile data) and try again."
+
 private fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
     val mac = Mac.getInstance("HmacSHA256")
     mac.init(SecretKeySpec(key, "HmacSHA256"))
@@ -355,24 +334,6 @@ private fun hkdf(ikm: ByteArray, info: String, length: Int, salt: ByteArray = By
         counter++
     }
     return result
-}
-
-private fun pbkdf2HmacSha256(password: ByteArray, salt: ByteArray, iterations: Int, keyLengthBytes: Int): ByteArray {
-    val hLen = 32
-    val numBlocks = (keyLengthBytes + hLen - 1) / hLen
-    val result = ByteArray(numBlocks * hLen)
-    val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(password, "HmacSHA256")) }
-    for (blockIndex in 1..numBlocks) {
-        val blockIndexBytes = ByteBuffer.allocate(4).putInt(blockIndex).array()
-        var u = mac.doFinal(salt + blockIndexBytes)
-        val t = u.copyOf()
-        for (iter in 2..iterations) {
-            u = mac.doFinal(u)
-            for (i in t.indices) t[i] = (t[i].toInt() xor u[i].toInt()).toByte()
-        }
-        System.arraycopy(t, 0, result, (blockIndex - 1) * hLen, hLen)
-    }
-    return result.copyOf(keyLengthBytes)
 }
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

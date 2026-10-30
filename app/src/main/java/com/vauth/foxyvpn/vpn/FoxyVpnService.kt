@@ -677,10 +677,24 @@ class FoxyVpnService : VpnService() {
 
                 val pass = try {
                     guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                } catch (invalid: TokenInvalidError) {
-                    AppLogger.w(TAG, "proxy pass rejected, activating Guardian entitlement and retrying", invalid)
-                    guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                    guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                } catch (rejected: TokenInvalidError) {
+                    AppLogger.w(TAG, "Guardian rejected the OAuth access token; renewing it and retrying", rejected)
+                    val renewed = renewAccessToken(tokenStore)
+                    if (renewed != null) {
+                        auth = renewed
+                        AppLogger.i(TAG, "the account's OAuth token was renewed after the rejection")
+                        try {
+                            guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                        } catch (stillRejected: TokenInvalidError) {
+                            AppLogger.w(TAG, "still rejected; activating the Guardian entitlement and retrying", stillRejected)
+                            guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                            guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                        }
+                    } else {
+                        AppLogger.w(TAG, "token renewal failed; activating Guardian entitlement and retrying")
+                        guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                        guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                    }
                 }
                 if (pass.quotaRemaining != null) {
                     settingsStore.cachedQuotaRemaining = pass.quotaRemaining
