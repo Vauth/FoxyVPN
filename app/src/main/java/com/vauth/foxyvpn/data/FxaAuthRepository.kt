@@ -27,6 +27,14 @@ enum class SessionStatus {
 
 class FxaApiError(message: String, val errno: Int?, val statusCode: Int?) : Exception(message)
 
+val FxaApiError.isUnconfirmedSession: Boolean
+    get() = errno == 104 || (statusCode == 400 && message?.contains("Unconfirmed session", ignoreCase = true) == true)
+
+fun Throwable.isUnconfirmedSession(): Boolean =
+    (this as? FxaApiError)?.isUnconfirmedSession == true ||
+        message?.contains("Unconfirmed session", ignoreCase = true) == true
+
+
 class FxaRefreshFailure(
     message: String,
     val permanent: Boolean,

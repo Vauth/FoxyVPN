@@ -15,7 +15,10 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Icon
@@ -37,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.vauth.foxyvpn.data.AppLogger
 import java.lang.ref.WeakReference
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 private const val TAG = "BrowserLogin"
@@ -82,6 +86,74 @@ private val WEBCHANNEL_HOOK_JS = """
       document.dispatchEvent(eventStr);
     } catch (e) {}
   };
+  var checkVerifyUrl = function(url) {
+    if (typeof url !== 'string') return false;
+    var u = url.toLowerCase();
+    return u.indexOf('/verify') !== -1 || u.indexOf('/totp') !== -1 || u.indexOf('/session') !== -1;
+  };
+  var checkSuccessUrl = function(url) {
+    if (typeof url !== 'string') return false;
+    var u = url.toLowerCase();
+    return u.indexOf('confirmed') !== -1 || u.indexOf('connect_another_device') !== -1 ||
+           u.indexOf('/pair') !== -1 || u.indexOf('/settings') !== -1 || u.indexOf('/complete') !== -1;
+  };
+  if (window.fetch) {
+    var origFetch = window.fetch;
+    window.fetch = function() {
+      var reqUrl = (arguments[0] && arguments[0].url) || arguments[0] || '';
+      return origFetch.apply(this, arguments).then(function(res) {
+        try {
+          if (res && res.ok && checkVerifyUrl(reqUrl)) {
+            foxyWebChannel.onSessionVerified();
+          }
+        } catch (e) {}
+        return res;
+      });
+    };
+  }
+  if (window.XMLHttpRequest) {
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) {
+      this.__foxyReqUrl = url;
+      return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function() {
+      this.addEventListener('load', function() {
+        try {
+          if (this.status >= 200 && this.status < 300 && checkVerifyUrl(this.__foxyReqUrl)) {
+            foxyWebChannel.onSessionVerified();
+          }
+        } catch (e) {}
+      });
+      return origSend.apply(this, arguments);
+    };
+  }
+  var notifyNav = function() {
+    try {
+      if (checkSuccessUrl(window.location.href)) {
+        foxyWebChannel.onSessionVerified();
+      }
+    } catch (e) {}
+  };
+  var origPushState = history.pushState;
+  if (origPushState) {
+    history.pushState = function() {
+      var ret = origPushState.apply(this, arguments);
+      notifyNav();
+      return ret;
+    };
+  }
+  var origReplaceState = history.replaceState;
+  if (origReplaceState) {
+    history.replaceState = function() {
+      var ret = origReplaceState.apply(this, arguments);
+      notifyNav();
+      return ret;
+    };
+  }
+  window.addEventListener('popstate', notifyNav);
+  window.addEventListener('hashchange', notifyNav);
 })();
 """.trimIndent()
 
@@ -90,10 +162,19 @@ private class WebChannelBridge(
     private val onSessionToken: (String) -> Unit,
 ) {
     private val webViewRef = WeakReference(webView)
+    @Volatile
+    var pendingSessionToken: String? = null
+        private set
 
     @JavascriptInterface
     fun onMessage(payload: String) {
         onMessage(payload, "https://accounts.firefox.com")
+    }
+
+    @JavascriptInterface
+    fun onSessionVerified() {
+        val token = pendingSessionToken ?: return
+        notifySessionToken(token)
     }
 
     @JavascriptInterface
@@ -124,14 +205,43 @@ private class WebChannelBridge(
                 val token = data.optString("sessionToken", "").trim()
                     .ifBlank { data.optString("token", "").trim() }
                 if (SESSION_TOKEN_HEX.matches(token)) {
-                    val view = webViewRef.get()
-                    if (view != null) {
-                        view.post { onSessionToken(token) }
-                    } else {
-                        onSessionToken(token)
+                    pendingSessionToken = token
+                    val isVerified = if (data.has("verified")) data.optBoolean("verified", true) else true
+                    if (isVerified) {
+                        notifySessionToken(token)
                     }
                 }
+                if (messageId.isNotBlank()) {
+                    reply(messageId, command, """{"ok":true}""")
+                }
             }
+            "fxaccounts:email_verified", "fxaccounts:session_verified", "fxaccounts:verified" -> {
+                val token = data.optString("sessionToken", "").trim()
+                    .ifBlank { data.optString("token", "").trim() }
+                    .ifBlank { pendingSessionToken ?: "" }
+                if (SESSION_TOKEN_HEX.matches(token)) {
+                    pendingSessionToken = token
+                    notifySessionToken(token)
+                }
+                if (messageId.isNotBlank()) {
+                    reply(messageId, command, """{"ok":true}""")
+                }
+            }
+            else -> {
+                if (messageId.isNotBlank()) {
+                    reply(messageId, command, """{"ok":true}""")
+                }
+            }
+        }
+    }
+
+    fun notifySessionToken(token: String) {
+        if (!SESSION_TOKEN_HEX.matches(token)) return
+        val view = webViewRef.get()
+        if (view != null) {
+            view.post { onSessionToken(token) }
+        } else {
+            onSessionToken(token)
         }
     }
 
@@ -146,6 +256,16 @@ private class WebChannelBridge(
     }
 }
 
+private fun isSuccessUrl(url: String?): Boolean {
+    if (url.isNullOrBlank()) return false
+    val u = url.lowercase()
+    return u.contains("/signin/confirmed") ||
+        u.contains("/connect_another_device") ||
+        u.contains("/pair") ||
+        u.contains("/settings") ||
+        u.contains("/complete")
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun BrowserLoginScreen(
@@ -156,18 +276,12 @@ fun BrowserLoginScreen(
     onCanceled: () -> Unit,
 ) {
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
-    var capturedToken by remember { mutableStateOf<String?>(null) }
+    var bridgeInstance by remember { mutableStateOf<WebChannelBridge?>(null) }
     var pageTitle by remember { mutableStateOf("") }
     var pageProgress by remember { mutableIntStateOf(0) }
     var pageLoaded by remember { mutableStateOf(false) }
     val currentOnSession by rememberUpdatedState(onSessionCaptured)
     val currentOnCanceled by rememberUpdatedState(onCanceled)
-
-    LaunchedEffect(errorMessage) {
-        if (errorMessage != null) {
-            capturedToken = null
-        }
-    }
 
     BackHandler(enabled = true) {
         if (webViewInstance?.canGoBack() == true) {
@@ -179,12 +293,26 @@ fun BrowserLoginScreen(
 
     fun handleSession(token: String) {
         if (busy) return
-        if (capturedToken == token) return
-        capturedToken = token
         currentOnSession(token)
     }
 
-    Column(Modifier.fillMaxSize()) {
+    LaunchedEffect(bridgeInstance?.pendingSessionToken, busy) {
+        val pendingToken = bridgeInstance?.pendingSessionToken
+        if (pendingToken != null && !busy) {
+            delay(4000)
+            if (!busy) {
+                handleSession(pendingToken)
+            }
+        }
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .imePadding(),
+    ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
@@ -248,10 +376,9 @@ fun BrowserLoginScreen(
                         val cookieManager = CookieManager.getInstance()
                         cookieManager.setAcceptCookie(true)
                         cookieManager.setAcceptThirdPartyCookies(this, true)
-                        addJavascriptInterface(
-                            WebChannelBridge(this, ::handleSession),
-                            "foxyWebChannel",
-                        )
+                        val bridge = WebChannelBridge(this, ::handleSession)
+                        bridgeInstance = bridge
+                        addJavascriptInterface(bridge, "foxyWebChannel")
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(
                                 view: WebView,
@@ -270,6 +397,17 @@ fun BrowserLoginScreen(
                                 return true
                             }
 
+                            override fun doUpdateVisitedHistory(
+                                view: WebView,
+                                url: String?,
+                                isReload: Boolean,
+                            ) {
+                                super.doUpdateVisitedHistory(view, url, isReload)
+                                if (isSuccessUrl(url)) {
+                                    bridge.onSessionVerified()
+                                }
+                            }
+
                             override fun onPageStarted(
                                 view: WebView,
                                 url: String?,
@@ -277,6 +415,9 @@ fun BrowserLoginScreen(
                             ) {
                                 super.onPageStarted(view, url, favicon)
                                 pageLoaded = false
+                                if (isSuccessUrl(url)) {
+                                    bridge.onSessionVerified()
+                                }
                                 runCatching { view.evaluateJavascript(WEBCHANNEL_HOOK_JS, null) }
                             }
 
@@ -284,6 +425,9 @@ fun BrowserLoginScreen(
                                 super.onPageFinished(view, url)
                                 pageLoaded = true
                                 pageTitle = view.title.orEmpty()
+                                if (isSuccessUrl(url)) {
+                                    bridge.onSessionVerified()
+                                }
                                 runCatching { view.evaluateJavascript(WEBCHANNEL_HOOK_JS, null) }
                             }
                         }
@@ -303,6 +447,7 @@ fun BrowserLoginScreen(
                 modifier = Modifier.fillMaxSize(),
                 onRelease = { view ->
                     webViewInstance = null
+                    bridgeInstance = null
                     view.stopLoading()
                     view.destroy()
                 },

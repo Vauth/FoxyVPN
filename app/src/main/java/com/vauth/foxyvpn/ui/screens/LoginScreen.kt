@@ -26,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.vauth.foxyvpn.data.FxaAuthRepository
+import com.vauth.foxyvpn.data.isUnconfirmedSession
 import kotlinx.coroutines.launch
 
 @Composable
@@ -56,7 +57,9 @@ fun LoginScreen(
                 errorMessage = null
                 onSignedIn()
             }.onFailure {
-                errorMessage = it.message ?: "Browser sign-in failed. Please try again."
+                if (!it.isUnconfirmedSession()) {
+                    errorMessage = it.message ?: "Browser sign-in failed. Please try again."
+                }
             }
         }
     }
