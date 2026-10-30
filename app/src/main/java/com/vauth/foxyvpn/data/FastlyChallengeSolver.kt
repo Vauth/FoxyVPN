@@ -31,17 +31,6 @@ private val INIT_CALL_REGEX = Regex("init\\((\\[[^\\]]*\\]),\\s*\"([^\"]+)\"\\s*
 
 class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
 
-    /**
-     * Solve the Fastly bot-protection challenge and install the clearance cookies into
-     * the shared cookie jar.
-     *
-     * Fastly serves the challenge page with HTTP 406 (sometimes 403/200/503), so the
-     * HTTP status alone is meaningless — only body markers decide whether a response is
-     * a challenge. When the caller already received a challenged response it can hand
-     * that body over via [challengedBody] together with the origin that served it
-     * ([challengedOrigin]); the solver then replays that exact challenge instead of
-     * probing the hosts again.
-     */
     suspend fun solveAndInstall(
         challengedBody: String? = null,
         challengedOrigin: String? = null,
@@ -76,8 +65,6 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
     }
 
     private fun baseOriginFromPrefix(html: String): String? {
-        // Relative asset paths ("../..") are rare; Fastly normally embeds same-origin
-        // "/_fs-ch-..." references, so without an absolute hint there is nothing to do.
         val absolute = Regex("https://[A-Za-z0-9.-]+/_fs-ch-[A-Za-z0-9]+").find(html)?.value
         return absolute?.let { baseOrigin(it) }
     }
@@ -100,7 +87,6 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         return null
     }
 
-    /** GET that never inspects the status code: challenge pages arrive with 406/403/200/503. */
     private fun fetchPage(client: OkHttpClient, url: String, userAgent: String): String {
         val request = Request.Builder().url(url)
             .header("User-Agent", userAgent)
@@ -111,7 +97,6 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         }
     }
 
-    /** GET for challenge assets that must succeed (script.js, post-back, ...). */
     private fun fetchText(
         client: OkHttpClient,
         url: String,
@@ -238,8 +223,6 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         userAgent: String = MOZILLA_VPN_USER_AGENT,
     ) {
         val solverJar = SimpleCookieJar()
-        // Seed the solver jar with the shared control-plane cookies: the challenged
-        // request already stored any Fastly session cookies there via OkHttp.
         for (cookie in cookieJar.snapshotAll()) {
             solverJar.set(cookie.name, cookie.value, cookie.domain)
         }
@@ -273,8 +256,6 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                 if (!response.isSuccessful) throw FastlyChallengeError("challenge post-back returned HTTP ${response.code}")
                 val body = JSONObject(response.body?.string().orEmpty())
                 if (body.optString("status") == "success") {
-                    // Re-check with the solver's own client so the freshly issued
-                    // clearance cookies are actually sent.
                     val recheck = fetchPage(solver, "$origin/", userAgent)
                     if (looksLikeChallenge(recheck)) {
                         throw FastlyChallengeError("challenge cookie not accepted on this exit IP")

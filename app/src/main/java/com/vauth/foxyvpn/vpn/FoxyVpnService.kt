@@ -678,20 +678,20 @@ class FoxyVpnService : VpnService() {
                 val pass = try {
                     guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
                 } catch (rejected: TokenInvalidError) {
-                    // Mirror the reference client's recovery order: renew the OAuth
-                    // token first, then activate the entitlement, and only give up
-                    // after both fail. The final TokenInvalidError is fatal for the
-                    // dial loop, so a dead session surfaces as "sign in again"
-                    // instead of burning through all dial attempts.
                     AppLogger.w(TAG, "Guardian rejected the OAuth access token; renewing it and retrying", rejected)
-                    renewAccessToken(tokenStore)?.let { renewed ->
+                    val renewed = renewAccessToken(tokenStore)
+                    if (renewed != null) {
                         auth = renewed
                         AppLogger.i(TAG, "the account's OAuth token was renewed after the rejection")
-                    }
-                    try {
-                        guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                    } catch (stillRejected: TokenInvalidError) {
-                        AppLogger.w(TAG, "still rejected; activating the Guardian entitlement and retrying", stillRejected)
+                        try {
+                            guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                        } catch (stillRejected: TokenInvalidError) {
+                            AppLogger.w(TAG, "still rejected; activating the Guardian entitlement and retrying", stillRejected)
+                            guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                            guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                        }
+                    } else {
+                        AppLogger.w(TAG, "token renewal failed; activating Guardian entitlement and retrying")
                         guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
                         guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
                     }

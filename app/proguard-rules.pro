@@ -21,6 +21,7 @@
 
 -dontwarn reactor.blockhound.**
 
-# The FxA WebChannel bridge is reached from JS by its registered interface name;
-# keep its members so release builds never strip the @JavascriptInterface methods.
 -keep class com.vauth.foxyvpn.ui.screens.WebChannelBridge { *; }
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
