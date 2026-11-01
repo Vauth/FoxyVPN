@@ -19,102 +19,80 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.vauth.foxyvpn.R
 import com.vauth.foxyvpn.data.FxaAuthRepository
-import com.vauth.foxyvpn.data.isUnconfirmedSession
-import kotlinx.coroutines.launch
+import com.vauth.foxyvpn.ui.LoginViewModel
 
 @Composable
-fun LoginScreen(
-    authRepository: FxaAuthRepository,
-    onSignedIn: () -> Unit,
-) {
-    var browserStartUrl by rememberSaveable { mutableStateOf<String?>(null) }
-    var completingBrowserLogin by rememberSaveable { mutableStateOf(false) }
-    var errorMessage by rememberSaveable { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
-
-    fun startBrowserLogin() {
-        if (completingBrowserLogin) return
-        errorMessage = null
-        browserStartUrl = authRepository.getBrowserLoginUrl()
-    }
-
-    fun handleBrowserSession(sessionToken: String) {
-        if (completingBrowserLogin) return
-        completingBrowserLogin = true
-        errorMessage = null
-        scope.launch {
-            val result = authRepository.completeBrowserLogin(sessionToken)
-            completingBrowserLogin = false
-            result.onSuccess {
-                browserStartUrl = null
-                errorMessage = null
-                onSignedIn()
-            }.onFailure {
-                if (!it.isUnconfirmedSession()) {
-                    errorMessage = it.message ?: "Browser sign-in failed. Please try again."
-                }
-            }
-        }
-    }
+fun LoginScreen(authRepository: FxaAuthRepository, onSignedIn: () -> Unit) {
+    val model: LoginViewModel =
+        androidx.lifecycle.viewmodel.compose.viewModel(
+            factory = remember(authRepository) { LoginViewModel.factory(authRepository) }
+        )
+    val uiState by model.uiState.collectAsStateWithLifecycle()
+    val browserStartUrl = uiState.browserStartUrl
+    val completingBrowserLogin = uiState.isLoading
+    val errorMessage = uiState.errorMessage
+    val storageError by authRepository.storageError.collectAsStateWithLifecycle()
+    androidx.compose.runtime.LaunchedEffect(uiState.signedIn) { if (uiState.signedIn) onSignedIn() }
 
     if (browserStartUrl != null) {
         BrowserLoginScreen(
-            startUrl = browserStartUrl!!,
+            startUrl = browserStartUrl,
             busy = completingBrowserLogin,
+            authRepository = authRepository,
             errorMessage = errorMessage,
-            onSessionCaptured = ::handleBrowserSession,
-            onCanceled = {
-                browserStartUrl = null
-                completingBrowserLogin = false
-                errorMessage = null
-            },
+            onTokensCaptured = model::completeBrowserLoginWithTokens,
+            onSessionCaptured = model::completeBrowserLogin,
+            onCanceled = model::cancelVerification,
         )
         return
     }
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .statusBarsPadding()
-            .navigationBarsPadding()
-            .imePadding(),
+        modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding(),
         contentAlignment = Alignment.Center,
     ) {
         Column(
-            modifier = Modifier
-                .widthIn(max = 520.dp)
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(24.dp),
+            modifier =
+                Modifier.widthIn(max = 520.dp)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(24.dp),
             verticalArrangement = Arrangement.Center,
         ) {
-            Text("Sign in with Firefox", style = MaterialTheme.typography.headlineMedium)
+            Text(
+                stringResource(R.string.login_title),
+                style = MaterialTheme.typography.headlineMedium,
+            )
             Spacer(Modifier.height(8.dp))
             Text(
-                "FoxyVPN runs on the free 50 GB of monthly VPN traffic Mozilla includes with a Firefox account. No subscription is required.",
+                stringResource(R.string.login_desc),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            storageError?.let {
+                Spacer(Modifier.height(12.dp))
+                Text(it, color = MaterialTheme.colorScheme.error)
+            }
             Spacer(Modifier.height(24.dp))
 
             Button(
-                onClick = { startBrowserLogin() },
+                onClick = model::startBrowserLogin,
                 enabled = !completingBrowserLogin,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Sign in with Firefox")
+                Text(stringResource(R.string.login_btn_sign_in))
             }
             Text(
-                "Opens the official Mozilla sign-in page in an in-app browser and returns automatically once you are signed in.",
+                stringResource(R.string.login_help),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 6.dp),
@@ -126,9 +104,7 @@ fun LoginScreen(
                     text = it,
                     color = MaterialTheme.colorScheme.error,
                     textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                 )
             }
         }

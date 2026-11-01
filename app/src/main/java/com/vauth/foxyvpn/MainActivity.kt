@@ -17,30 +17,29 @@ import androidx.navigation.compose.rememberNavController
 import com.vauth.foxyvpn.ui.navigation.FoxyNavGraph
 import com.vauth.foxyvpn.ui.theme.FoxyVpnTheme
 import com.vauth.foxyvpn.ui.theme.rememberThemeController
+import com.vauth.foxyvpn.update.UpdatePrompt
 import com.vauth.foxyvpn.vpn.FoxyVpnService
 
 class MainActivity : ComponentActivity() {
 
-    private val vpnPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
-        if (result.resultCode == RESULT_OK) {
-            requestNotificationPermissionIfNeeded()
-            FoxyVpnService.start(this)
-        } else {
+    private val vpnPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) {
+                requestNotificationPermissionIfNeeded()
+                FoxyVpnService.start(this)
+            } else {
 
-            Toast.makeText(
-                this,
-                "FoxyVPN needs Android's VPN permission to tunnel this device's traffic. " +
-                    "Proxy-only mode in Settings works without it.",
-                Toast.LENGTH_LONG,
-            ).show()
+                Toast.makeText(
+                        this,
+                        getString(R.string.vpn_permission_denied_help),
+                        Toast.LENGTH_LONG,
+                    )
+                    .show()
+            }
         }
-    }
 
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) {  }
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     private fun requestConnect() {
         if ((application as FoxyVpnApp).settingsStore.proxyOnlyMode) {
@@ -60,27 +59,31 @@ class MainActivity : ComponentActivity() {
 
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        val alreadyGranted = ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.POST_NOTIFICATIONS,
-        ) == PackageManager.PERMISSION_GRANTED
+        val alreadyGranted =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
         if (!alreadyGranted) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        (application as FoxyVpnApp).appUpdater.check(automatic = true)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val app = application as FoxyVpnApp
         setContent {
-
             val themeController = rememberThemeController(app.settingsStore)
             FoxyVpnTheme(themeMode = themeController.mode) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val navController = rememberNavController()
+                    UpdatePrompt(app.appUpdater)
                     FoxyNavGraph(
                         navController = navController,
-                        app = app,
+                        container = app,
                         themeController = themeController,
                         onRequestConnect = { requestConnect() },
                         onDisconnect = { FoxyVpnService.stop(this) },

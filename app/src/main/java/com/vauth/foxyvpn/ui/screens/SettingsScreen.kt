@@ -1,42 +1,30 @@
 package com.vauth.foxyvpn.ui.screens
 
 import android.content.Intent
-import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
 import android.net.Uri
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.selectable
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Code
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -44,22 +32,52 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vauth.foxyvpn.BuildConfig
+import com.vauth.foxyvpn.R
+import com.vauth.foxyvpn.data.ProxySettingsRepository
 import com.vauth.foxyvpn.data.SettingsStore
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import com.vauth.foxyvpn.ui.ProxyEditor
+import com.vauth.foxyvpn.ui.ProxySettingsViewModel
+import com.vauth.foxyvpn.ui.settings.ConcurrencyPickerDialog
+import com.vauth.foxyvpn.ui.settings.CustomEdgeAddressDialog
+import com.vauth.foxyvpn.ui.settings.DnsProviderPickerDialog
+import com.vauth.foxyvpn.ui.settings.HttpVersionPickerDialog
+import com.vauth.foxyvpn.ui.settings.LatencyProbeDialog
+import com.vauth.foxyvpn.ui.settings.MtuPickerDialog
+import com.vauth.foxyvpn.ui.settings.ProxySettingsDialog
+import com.vauth.foxyvpn.ui.settings.SplitTunnelDialog
+import com.vauth.foxyvpn.ui.settings.TlsFragmentPickerDialog
+import com.vauth.foxyvpn.ui.settings.UtlsFingerprintPickerDialog
+import com.vauth.foxyvpn.vpn.FoxyVpnService
+import com.vauth.foxyvpn.vpn.TunnelHealth
 
-private const val GITHUB_URL = "https://github.com/vauth/foxyvpn"
+private const val GITHUB_URL = com.vauth.foxyvpn.data.AppLinks.SOURCE
+
+private enum class SettingsDialog {
+    NONE,
+    LATENCY_PROBE,
+    TLS_FRAGMENT,
+    UTLS_FINGERPRINT,
+    CONCURRENCY,
+    MTU,
+    DNS_PROVIDER,
+    EDGE_ADDRESS,
+    SPLIT_TUNNEL,
+    HTTP_VERSION,
+}
 
 @Composable
 fun SettingsScreen(
@@ -67,183 +85,140 @@ fun SettingsScreen(
     onOpenLogs: () -> Unit,
     onSignOut: () -> Unit,
     onBack: () -> Unit,
+    signOutInProgress: Boolean = false,
+    onCheckForUpdates: (() -> Unit)? = null,
+    automaticUpdates: Boolean = false,
+    onAutomaticUpdatesChange: ((Boolean) -> Unit)? = null,
 ) {
     val context = LocalContext.current
-    var exitCheckEnabled by remember { mutableStateOf(settingsStore.exitCheckEnabled) }
+    var automaticRecovery by remember { mutableStateOf(settingsStore.automaticRecovery) }
+    val health by FoxyVpnService.tunnelHealth.collectAsStateWithLifecycle()
     var dnsProvider by remember { mutableStateOf(settingsStore.dnsProvider) }
     var customDohUrl by remember { mutableStateOf(settingsStore.customDohUrl) }
-    var bootstrapDnsProvider by remember { mutableStateOf(settingsStore.bootstrapDnsProvider) }
-    var customBootstrapIp by remember { mutableStateOf(settingsStore.customBootstrapIp) }
-    var socksBindAddress by remember { mutableStateOf(settingsStore.socksBindAddress) }
-    var socksPort by remember { mutableStateOf(settingsStore.socksPort) }
-    var httpProxyEnabled by remember { mutableStateOf(settingsStore.httpProxyEnabled) }
-    var httpProxyPort by remember { mutableStateOf(settingsStore.httpProxyPort) }
     var proxyOnlyMode by remember { mutableStateOf(settingsStore.proxyOnlyMode) }
     var customEdgeAddress by remember { mutableStateOf(settingsStore.customEdgeAddress) }
-    var upstreamProxyEnabled by remember { mutableStateOf(settingsStore.upstreamProxyEnabled) }
-    var upstreamProxyType by remember { mutableStateOf(settingsStore.upstreamProxyType) }
-    var upstreamProxyHost by remember { mutableStateOf(settingsStore.upstreamProxyHost) }
-    var upstreamProxyPort by remember { mutableStateOf(settingsStore.upstreamProxyPort) }
-    var upstreamProxyUsername by remember { mutableStateOf(settingsStore.upstreamProxyUsername) }
-    var upstreamProxyPassword by remember { mutableStateOf(settingsStore.upstreamProxyPassword) }
     var excludedApps by remember { mutableStateOf(settingsStore.excludedApps) }
-    var mtu by remember { mutableStateOf(settingsStore.mtu) }
-    var showDnsProviderDialog by remember { mutableStateOf(false) }
-    var showBootstrapDnsDialog by remember { mutableStateOf(false) }
-    var showMtuDialog by remember { mutableStateOf(false) }
-    var showSocksBindDialog by remember { mutableStateOf(false) }
-    var showSocksPortDialog by remember { mutableStateOf(false) }
-    var showHttpPortDialog by remember { mutableStateOf(false) }
-    var showEdgeAddressDialog by remember { mutableStateOf(false) }
-    var showUpstreamProxyTypeDialog by remember { mutableStateOf(false) }
-    var showUpstreamProxyAddressDialog by remember { mutableStateOf(false) }
-    var showUpstreamProxyCredentialsDialog by remember { mutableStateOf(false) }
-    var showSplitTunnelDialog by remember { mutableStateOf(false) }
-    var tlsSplitMode by remember { mutableStateOf(settingsStore.tlsSplitMode) }
-    var showTlsSplitDialog by remember { mutableStateOf(false) }
+    var includedApps by remember { mutableStateOf(settingsStore.includedApps) }
+    var bypassLocalNetwork by remember { mutableStateOf(settingsStore.bypassLocalNetwork) }
+    var splitTunnelMode by remember { mutableStateOf(settingsStore.splitTunnelMode) }
+    var mtu by remember { mutableIntStateOf(settingsStore.mtu) }
+    var latencyProbeUrl by remember { mutableStateOf(settingsStore.latencyProbeUrl) }
+    var httpVersion by remember { mutableStateOf(settingsStore.httpVersion) }
+    var tlsFragmentMode by remember { mutableStateOf(settingsStore.tlsFragmentMode) }
+    var fragmentFallbackDelay by remember { mutableIntStateOf(settingsStore.fragmentFallbackDelay) }
+    var utlsFingerprint by remember { mutableStateOf(settingsStore.utlsFingerprint) }
+    var tcpFastOpen by remember { mutableStateOf(settingsStore.tcpFastOpen) }
+    var maxConcurrentStreams by remember { mutableIntStateOf(settingsStore.maxConcurrentStreams) }
+    var ipv6Enabled by remember { mutableStateOf(settingsStore.ipv6Enabled) }
+    var activeDialog by rememberSaveable { mutableStateOf(SettingsDialog.NONE) }
 
-    if (showMtuDialog) {
-        MtuPickerDialog(
+    val proxyViewModel: ProxySettingsViewModel =
+        viewModel(
+            factory =
+                remember(settingsStore) {
+                    ProxySettingsViewModel.factory(ProxySettingsRepository(settingsStore))
+                }
+        )
+    val proxyState by proxyViewModel.state.collectAsStateWithLifecycle()
+    ProxySettingsDialog(
+        proxyState,
+        proxyViewModel::close,
+        proxyViewModel::open,
+        proxyViewModel::save,
+        proxyViewModel::save,
+    )
+
+    when (activeDialog) {
+        SettingsDialog.NONE -> {}
+        SettingsDialog.LATENCY_PROBE -> LatencyProbeDialog(
+            current = latencyProbeUrl,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = {
+                settingsStore.latencyProbeUrl = it
+                latencyProbeUrl = it
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.TLS_FRAGMENT -> TlsFragmentPickerDialog(
+            currentMode = tlsFragmentMode,
+            currentDelay = fragmentFallbackDelay,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = { mode, delay ->
+                tlsFragmentMode = mode
+                settingsStore.tlsFragmentMode = mode
+                fragmentFallbackDelay = delay
+                settingsStore.fragmentFallbackDelay = delay
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.UTLS_FINGERPRINT -> UtlsFingerprintPickerDialog(
+            current = utlsFingerprint,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = {
+                utlsFingerprint = it
+                settingsStore.utlsFingerprint = it
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.CONCURRENCY -> ConcurrencyPickerDialog(
+            current = maxConcurrentStreams,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = {
+                maxConcurrentStreams = it
+                settingsStore.maxConcurrentStreams = it
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.MTU -> MtuPickerDialog(
             current = mtu,
-            onDismiss = { showMtuDialog = false },
+            minimum = if (ipv6Enabled) 1280 else SettingsStore.MIN_MTU,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
             onConfirm = {
                 mtu = it
                 settingsStore.mtu = it
-                showMtuDialog = false
+                activeDialog = SettingsDialog.NONE
             },
         )
-    }
-
-    if (showDnsProviderDialog) {
-        DnsProviderPickerDialog(
+        SettingsDialog.DNS_PROVIDER -> DnsProviderPickerDialog(
             currentProvider = dnsProvider,
             currentCustomUrl = customDohUrl,
-            onDismiss = { showDnsProviderDialog = false },
+            onDismiss = { activeDialog = SettingsDialog.NONE },
             onConfirm = { provider, url ->
+                settingsStore.saveDns(provider, url)
                 dnsProvider = provider
-                settingsStore.dnsProvider = provider
-                customDohUrl = url
-                settingsStore.customDohUrl = url
-                showDnsProviderDialog = false
+                customDohUrl = settingsStore.customDohUrl
+                activeDialog = SettingsDialog.NONE
             },
         )
-    }
-    if (showBootstrapDnsDialog) {
-        BootstrapDnsPickerDialog(
-            currentProvider = bootstrapDnsProvider,
-            currentCustomIp = customBootstrapIp,
-            onDismiss = { showBootstrapDnsDialog = false },
-            onConfirm = { provider, ip ->
-                bootstrapDnsProvider = provider
-                settingsStore.bootstrapDnsProvider = provider
-                customBootstrapIp = ip
-                settingsStore.customBootstrapIp = ip
-                showBootstrapDnsDialog = false
-            },
-        )
-    }
-    if (showSocksBindDialog) {
-        SocksBindAddressPickerDialog(
-            current = socksBindAddress,
-            onDismiss = { showSocksBindDialog = false },
-            onConfirm = {
-                socksBindAddress = it
-                settingsStore.socksBindAddress = it
-                showSocksBindDialog = false
-            },
-        )
-    }
-    if (showSocksPortDialog) {
-        SocksPortPickerDialog(
-            current = socksPort,
-            onDismiss = { showSocksPortDialog = false },
-            onConfirm = {
-                socksPort = it
-                settingsStore.socksPort = it
-                showSocksPortDialog = false
-            },
-        )
-    }
-    if (showHttpPortDialog) {
-        HttpPortPickerDialog(
-            current = httpProxyPort,
-            onDismiss = { showHttpPortDialog = false },
-            onConfirm = {
-                httpProxyPort = it
-                settingsStore.httpProxyPort = it
-                showHttpPortDialog = false
-            },
-        )
-    }
-    if (showEdgeAddressDialog) {
-        CustomEdgeAddressDialog(
+        SettingsDialog.EDGE_ADDRESS -> CustomEdgeAddressDialog(
             current = customEdgeAddress,
-            onDismiss = { showEdgeAddressDialog = false },
+            onDismiss = { activeDialog = SettingsDialog.NONE },
             onConfirm = {
                 customEdgeAddress = it
                 settingsStore.customEdgeAddress = it
-                showEdgeAddressDialog = false
+                activeDialog = SettingsDialog.NONE
             },
         )
-    }
-    if (showUpstreamProxyTypeDialog) {
-        UpstreamProxyTypePickerDialog(
-            current = upstreamProxyType,
-            onDismiss = { showUpstreamProxyTypeDialog = false },
+        SettingsDialog.SPLIT_TUNNEL -> SplitTunnelDialog(
+            currentMode = splitTunnelMode,
+            currentExcluded = excludedApps,
+            currentIncluded = includedApps,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = { mode, excluded, included ->
+                settingsStore.saveSplitTunneling(mode, excluded, included)
+                splitTunnelMode = mode
+                excludedApps = excluded
+                includedApps = included
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.HTTP_VERSION -> HttpVersionPickerDialog(
+            current = httpVersion,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
             onConfirm = {
-                upstreamProxyType = it
-                settingsStore.upstreamProxyType = it
-                showUpstreamProxyTypeDialog = false
-            },
-        )
-    }
-    if (showUpstreamProxyAddressDialog) {
-        UpstreamProxyAddressDialog(
-            currentHost = upstreamProxyHost,
-            currentPort = upstreamProxyPort,
-            onDismiss = { showUpstreamProxyAddressDialog = false },
-            onConfirm = { host, port ->
-                upstreamProxyHost = host
-                upstreamProxyPort = port
-                settingsStore.upstreamProxyHost = host
-                settingsStore.upstreamProxyPort = port
-                showUpstreamProxyAddressDialog = false
-            },
-        )
-    }
-    if (showUpstreamProxyCredentialsDialog) {
-        UpstreamProxyCredentialsDialog(
-            currentUsername = upstreamProxyUsername,
-            currentPassword = upstreamProxyPassword,
-            onDismiss = { showUpstreamProxyCredentialsDialog = false },
-            onConfirm = { username, password ->
-                upstreamProxyUsername = username
-                upstreamProxyPassword = password
-                settingsStore.upstreamProxyUsername = username
-                settingsStore.upstreamProxyPassword = password
-                showUpstreamProxyCredentialsDialog = false
-            },
-        )
-    }
-    if (showSplitTunnelDialog) {
-        SplitTunnelDialog(
-            current = excludedApps,
-            onDismiss = { showSplitTunnelDialog = false },
-            onConfirm = {
-                excludedApps = it
-                settingsStore.excludedApps = it
-                showSplitTunnelDialog = false
-            },
-        )
-    }
-    if (showTlsSplitDialog) {
-        TlsSplitModePickerDialog(
-            current = tlsSplitMode,
-            onDismiss = { showTlsSplitDialog = false },
-            onConfirm = {
-                tlsSplitMode = it
-                settingsStore.tlsSplitMode = it
-                showTlsSplitDialog = false
+                httpVersion = it
+                settingsStore.httpVersion = it
+                activeDialog = SettingsDialog.NONE
             },
         )
     }
@@ -251,805 +226,427 @@ fun SettingsScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Settings") },
+                title = { Text(stringResource(R.string.settings_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
                     }
                 },
             )
-        },
+        }
     ) { padding ->
-        Column(
-            Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState()),
-        ) {
-            SectionLabel("Connection")
+        Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())) {
+            SectionLabel(stringResource(R.string.settings_section_connection))
             ListItem(
-                headlineContent = { Text("Verify exit location") },
-                supportingContent = { Text("Check that the tunnel exits in the selected country") },
+                headlineContent = { Text(stringResource(R.string.settings_always_on_vpn)) },
+                supportingContent = { Text(stringResource(R.string.settings_always_on_help)) },
                 trailingContent = {
-                    Switch(
-                        checked = exitCheckEnabled,
-                        onCheckedChange = {
-                            exitCheckEnabled = it
-                            settingsStore.exitCheckEnabled = it
-                        },
-                    )
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
+                modifier =
+                    Modifier.clickable {
+                        runCatching {
+                                context.startActivity(
+                                    Intent(android.provider.Settings.ACTION_VPN_SETTINGS)
+                                )
+                            }
+                            .onFailure {
+                                android.widget.Toast.makeText(
+                                        context,
+                                        "VPN settings are unavailable on this device",
+                                        android.widget.Toast.LENGTH_SHORT,
+                                    )
+                                    .show()
+                            }
+                    },
             )
             ListItem(
-                headlineContent = { Text("Tunnel MTU") },
+                headlineContent = { Text(stringResource(R.string.settings_latency_test_url)) },
+                supportingContent = { Text(latencyProbeUrl) },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.LATENCY_PROBE },
+            )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_tunnel_mtu)) },
                 supportingContent = { Text(mtu.toString()) },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showMtuDialog = true },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.MTU },
             )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            SectionLabel("DNS")
+            SectionLabel(stringResource(R.string.settings_section_dns))
             ListItem(
-                headlineContent = { Text("Tunnel DNS") },
+                headlineContent = { Text(stringResource(R.string.settings_dns_provider)) },
                 supportingContent = {
-                    val subtitle = when (dnsProvider) {
-                        SettingsStore.DnsProvider.SYSTEM_DEFAULT -> "Default"
-                        SettingsStore.DnsProvider.CUSTOM -> customDohUrl.ifBlank { "Custom DoH (Not configured)" }
-                        else -> dnsProvider.label
-                    }
+                    val subtitle =
+                        when (dnsProvider) {
+                            SettingsStore.DnsProvider.CUSTOM ->
+                                customDohUrl.ifBlank { "Custom DoH" }
+                            else -> dnsProvider.label
+                        }
                     Text(subtitle)
                 },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showDnsProviderDialog = true },
-            )
-            ListItem(
-                headlineContent = { Text("Resolver DNS") },
-                supportingContent = {
-                    val subtitle = when (bootstrapDnsProvider) {
-                        SettingsStore.BootstrapDnsProvider.CUSTOM -> customBootstrapIp.ifBlank { "Custom IP (Not configured)" }
-                        SettingsStore.BootstrapDnsProvider.SYSTEM -> "System DNS"
-                        else -> bootstrapDnsProvider.label
-                    }
-                    Text(subtitle)
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showBootstrapDnsDialog = true },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.DNS_PROVIDER },
             )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            SectionLabel("Local proxy")
-            ListItem(
-                headlineContent = { Text("Proxy-only mode") },
-                supportingContent = { Text("Run local proxy servers (SOCKS5 & HTTP), without a VPN interface") },
-                trailingContent = {
-                    Switch(
-                        checked = proxyOnlyMode,
-                        onCheckedChange = {
-                            proxyOnlyMode = it
-                            settingsStore.proxyOnlyMode = it
-                        },
-                    )
+            SectionLabel(stringResource(R.string.proxy))
+            SettingsToggle(
+                title = stringResource(R.string.settings_proxy_only_mode),
+                summary = stringResource(R.string.settings_proxy_only_help),
+                checked = proxyOnlyMode,
+                onCheckedChange = {
+                    settingsStore.proxyOnlyMode = it
+                    proxyOnlyMode = it
                 },
             )
-            ListItem(
-                headlineContent = { Text("Local address") },
-                supportingContent = { Text(socksBindAddress) },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showSocksBindDialog = true },
-            )
-            ListItem(
-                headlineContent = { Text("SOCKS5 port") },
-                supportingContent = { Text(socksPort.toString()) },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showSocksPortDialog = true },
-            )
-            ListItem(
-                headlineContent = { Text("Enable HTTP proxy") },
-                supportingContent = { Text("Run local HTTP proxy alongside SOCKS5") },
-                trailingContent = {
-                    Switch(
-                        checked = httpProxyEnabled,
-                        onCheckedChange = {
-                            httpProxyEnabled = it
-                            settingsStore.httpProxyEnabled = it
-                        },
-                    )
-                },
-            )
-            if (httpProxyEnabled) {
-                ListItem(
-                    headlineContent = { Text("HTTP port") },
-                    supportingContent = { Text(httpProxyPort.toString()) },
-                    trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                    modifier = Modifier.clickable { showHttpPortDialog = true },
+            if (proxyState.editor == null && proxyState.error != null) {
+                Text(
+                    proxyState.error.orEmpty(),
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
                 )
+                TextButton(onClick = proxyViewModel::reload) {
+                    Text(stringResource(R.string.retry))
+                }
             }
-
-            HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            SectionLabel("Split tunneling")
             ListItem(
-                headlineContent = { Text("Excluded apps") },
+                headlineContent = { Text(stringResource(R.string.local_proxy)) },
+                supportingContent = {
+                    val summary = proxyState.summary
+                    Text(
+                        if (summary == null) stringResource(R.string.loading)
+                        else
+                            stringResource(
+                                R.string.local_proxy_summary,
+                                SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS,
+                                summary.localPort,
+                            )
+                    )
+                },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier =
+                    Modifier.clickable(enabled = !proxyState.busy && proxyState.summary != null) {
+                        proxyViewModel.open(ProxyEditor.LOCAL)
+                    },
+            )
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            SectionLabel(stringResource(R.string.settings_section_split_tunnel))
+            SettingsToggle(
+                title = stringResource(R.string.settings_bypass_local_network),
+                summary = stringResource(R.string.settings_bypass_local_network_help),
+                checked = bypassLocalNetwork,
+                enabled = !proxyOnlyMode,
+                onCheckedChange = {
+                    settingsStore.bypassLocalNetwork = it
+                    bypassLocalNetwork = it
+                },
+            )
+            ListItem(
+                headlineContent = {
+                    Text(
+                        if (splitTunnelMode == SettingsStore.SplitTunnelMode.INCLUDE)
+                            stringResource(R.string.settings_included_apps)
+                        else stringResource(R.string.settings_excluded_apps)
+                    )
+                },
                 supportingContent = {
                     Text(
-                        if (excludedApps.isEmpty()) {
-                            "None"
-                        } else {
-                            "${excludedApps.size} app(s) bypass the VPN"
-                        },
+                        (if (splitTunnelMode == SettingsStore.SplitTunnelMode.INCLUDE) includedApps
+                            else excludedApps)
+                            .let {
+                                if (it.isEmpty()) stringResource(R.string.settings_none)
+                                else pluralStringResource(R.plurals.settings_apps_count, it.size, it.size)
+                            }
                     )
                 },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showSplitTunnelDialog = true },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.SPLIT_TUNNEL },
             )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            SectionLabel("Advanced")
+            SectionLabel(stringResource(R.string.settings_section_advanced))
             ListItem(
-                headlineContent = { Text("Custom edge address") },
-                supportingContent = { Text(customEdgeAddress.ifBlank { "Not set" }) },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showEdgeAddressDialog = true },
-            )
-            ListItem(
-                headlineContent = { Text("TLS fragmentation") },
-                supportingContent = { Text(tlsSplitMode.label) },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                modifier = Modifier.clickable { showTlsSplitDialog = true },
-            )
-            ListItem(
-                headlineContent = { Text("Chain through upstream proxy") },
-                supportingContent = { Text("Connect to the VPN server through another proxy first") },
+                headlineContent = { Text(stringResource(R.string.settings_custom_edge_address)) },
+                supportingContent = { Text(customEdgeAddress.ifBlank { stringResource(R.string.not_set) }) },
                 trailingContent = {
-                    Switch(
-                        checked = upstreamProxyEnabled,
-                        onCheckedChange = {
-                            upstreamProxyEnabled = it
-                            settingsStore.upstreamProxyEnabled = it
-                        },
-                    )
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.EDGE_ADDRESS },
             )
-            if (upstreamProxyEnabled) {
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_transport_protocol)) },
+                supportingContent = { Text(httpVersion.label) },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.HTTP_VERSION },
+            )
+            SettingsToggle(
+                title = stringResource(R.string.upstream_proxy),
+                summary = stringResource(R.string.upstream_proxy_help),
+                checked = proxyState.summary?.upstreamEnabled ?: settingsStore.upstreamProxyEnabled,
+                enabled =
+                    !proxyState.busy &&
+                        (proxyState.summary != null || settingsStore.upstreamProxyEnabled),
+                onCheckedChange = proxyViewModel::setUpstreamEnabled,
+            )
+            if (proxyState.summary?.upstreamEnabled == true) {
+                if (proxyState.summary?.upstreamReviewRequired == true) {
+                    Text(
+                        stringResource(R.string.upstream_review_required),
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
+                }
                 ListItem(
-                    headlineContent = { Text("Proxy type") },
-                    supportingContent = { Text(upstreamProxyType.name) },
-                    trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                    modifier = Modifier.clickable { showUpstreamProxyTypeDialog = true },
-                )
-                ListItem(
-                    headlineContent = { Text("Proxy address") },
-                    supportingContent = {
-                        Text(
-                            if (upstreamProxyHost.isBlank()) {
-                                "Not set"
-                            } else {
-                                "$upstreamProxyHost:$upstreamProxyPort"
-                            },
+                    headlineContent = { Text(stringResource(R.string.proxy_type)) },
+                    supportingContent = { Text(proxyState.summary?.upstreamType?.name.orEmpty()) },
+                    trailingContent = {
+                        Icon(
+                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
                         )
                     },
-                    trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                    modifier = Modifier.clickable { showUpstreamProxyAddressDialog = true },
+                    modifier =
+                        Modifier.clickable(enabled = !proxyState.busy) {
+                            proxyViewModel.open(ProxyEditor.UPSTREAM_TYPE)
+                        },
                 )
                 ListItem(
-                    headlineContent = { Text("Proxy credentials") },
+                    headlineContent = { Text(stringResource(R.string.proxy_address)) },
                     supportingContent = {
-                        Text(if (upstreamProxyUsername.isBlank()) "None" else upstreamProxyUsername)
+                        val summary = proxyState.summary
+                        val host = summary?.upstreamHost.orEmpty()
+                        Text(
+                            if (host.isBlank()) stringResource(R.string.not_set)
+                            else "${if (':' in host) "[$host]" else host}:${summary?.upstreamPort}"
+                        )
                     },
-                    trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
-                    modifier = Modifier.clickable { showUpstreamProxyCredentialsDialog = true },
+                    trailingContent = {
+                        Icon(
+                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
+                        )
+                    },
+                    modifier =
+                        Modifier.clickable(enabled = !proxyState.busy) {
+                            proxyViewModel.open(ProxyEditor.UPSTREAM_ADDRESS)
+                        },
+                )
+                ListItem(
+                    headlineContent = { Text(stringResource(R.string.proxy_credentials)) },
+                    supportingContent = { Text(stringResource(R.string.proxy_credentials_help)) },
+                    trailingContent = {
+                        Icon(
+                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
+                        )
+                    },
+                    modifier =
+                        Modifier.clickable(enabled = !proxyState.busy) {
+                            proxyViewModel.open(ProxyEditor.UPSTREAM_CREDENTIALS)
+                        },
                 )
             }
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            SectionLabel("About")
+            SectionLabel(stringResource(R.string.settings_section_anticensorship))
             ListItem(
-                headlineContent = { Text("View logs") },
-                supportingContent = { Text("Recent connection activity") },
-                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
+                headlineContent = { Text(stringResource(R.string.settings_tls_fragmentation)) },
+                supportingContent = {
+                    Text(
+                        if (tlsFragmentMode == SettingsStore.TlsFragmentMode.OFF) {
+                            stringResource(R.string.settings_disabled)
+                        } else if (tlsFragmentMode == SettingsStore.TlsFragmentMode.RECORD) {
+                            tlsFragmentMode.label
+                        } else {
+                            "${tlsFragmentMode.label}, ${fragmentFallbackDelay}ms"
+                        }
+                    )
+                },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.TLS_FRAGMENT },
+            )
+            ListItem(
+                headlineContent = {
+                    Text(stringResource(R.string.settings_browser_tls_fingerprint))
+                },
+                supportingContent = { Text(utlsFingerprint.label) },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.UTLS_FINGERPRINT },
+            )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_multiplex_concurrency)) },
+                supportingContent = {
+                    Text(pluralStringResource(R.plurals.stream_count, maxConcurrentStreams, maxConcurrentStreams))
+                },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.CONCURRENCY },
+            )
+            SettingsToggle(
+                title = stringResource(R.string.settings_tcp_fast_open),
+                summary = stringResource(R.string.settings_tcp_fast_open_help),
+                checked = tcpFastOpen,
+                onCheckedChange = {
+                    settingsStore.tcpFastOpen = it
+                    tcpFastOpen = it
+                },
+            )
+            SettingsToggle(
+                title = stringResource(R.string.settings_ipv6_tunnel),
+                summary =
+                    if (ipv6Enabled) stringResource(R.string.settings_dual_stack)
+                    else stringResource(R.string.settings_ipv4_only),
+                checked = ipv6Enabled,
+                onCheckedChange = {
+                    if (it && mtu < 1280) {
+                        settingsStore.mtu = 1280
+                        mtu = 1280
+                    }
+                    settingsStore.ipv6Enabled = it
+                    ipv6Enabled = it
+                },
+            )
+
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            SectionLabel(stringResource(R.string.settings_section_health))
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_tunnel_health)) },
+                supportingContent = {
+                    Text(
+                        when (health) {
+                            TunnelHealth.UNKNOWN -> stringResource(R.string.settings_health_not_connected)
+                            TunnelHealth.CHECKING -> stringResource(R.string.settings_health_checking)
+                            TunnelHealth.HEALTHY -> stringResource(R.string.settings_health_healthy)
+                            TunnelHealth.NO_NETWORK -> stringResource(R.string.settings_health_no_network)
+                            TunnelHealth.UNREACHABLE ->
+                                stringResource(R.string.settings_health_unreachable)
+                        }
+                    )
+                },
+            )
+            SettingsToggle(
+                title = stringResource(R.string.settings_automatic_connection_recovery),
+                summary = stringResource(R.string.settings_recovery_help),
+                checked = automaticRecovery,
+                onCheckedChange = {
+                    settingsStore.automaticRecovery = it
+                    automaticRecovery = it
+                },
+            )
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            SectionLabel(stringResource(R.string.settings_section_about))
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_view_logs)) },
+                supportingContent = { Text(stringResource(R.string.settings_logs_help)) },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
                 modifier = Modifier.clickable(onClick = onOpenLogs),
             )
             ListItem(
-                headlineContent = { Text("Version") },
+                headlineContent = { Text(stringResource(R.string.settings_version)) },
                 supportingContent = { Text(BuildConfig.VERSION_NAME) },
             )
             ListItem(
-                headlineContent = { Text("Source code") },
+                headlineContent = { Text(stringResource(R.string.settings_check_for_updates)) },
+                supportingContent = { Text(stringResource(R.string.settings_update_source)) },
+                modifier =
+                    Modifier.clickable(enabled = onCheckForUpdates != null) {
+                        onCheckForUpdates?.invoke()
+                    },
+            )
+            SettingsToggle(
+                title = stringResource(R.string.settings_automatic_update_checks),
+                summary = stringResource(R.string.settings_automatic_updates_help),
+                checked = automaticUpdates,
+                enabled = onAutomaticUpdatesChange != null,
+                onCheckedChange = {
+                    onAutomaticUpdatesChange?.invoke(it)
+                },
+            )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_source_code)) },
                 supportingContent = { Text(GITHUB_URL) },
                 leadingContent = { Icon(Icons.Filled.Code, contentDescription = null) },
-                modifier = Modifier.clickable {
-                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL)))
-                },
+                modifier =
+                    Modifier.clickable {
+                        runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL))
+                                )
+                            }
+                            .onFailure {
+                                android.widget.Toast.makeText(
+                                        context,
+                                        context.getString(R.string.browser_unavailable),
+                                        android.widget.Toast.LENGTH_SHORT,
+                                    )
+                                    .show()
+                            }
+                    },
             )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
             Button(
                 onClick = onSignOut,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                enabled = !signOutInProgress,
+                colors =
+                    ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    ),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
             ) {
                 Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text("Sign out")
+                Text(stringResource(R.string.settings_sign_out))
             }
         }
     }
 }
 
 @Composable
-private fun DnsProviderPickerDialog(
-    currentProvider: SettingsStore.DnsProvider,
-    currentCustomUrl: String,
-    onDismiss: () -> Unit,
-    onConfirm: (SettingsStore.DnsProvider, String) -> Unit,
+private fun SettingsToggle(
+    title: String,
+    summary: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit,
 ) {
-    var selectedProvider by remember { mutableStateOf(currentProvider) }
-    var urlText by remember { mutableStateOf(currentCustomUrl) }
-    val isCustom = selectedProvider == SettingsStore.DnsProvider.CUSTOM
-    val isValidCustomUrl = SettingsStore.isValidDohUrl(urlText)
-    val canSave = !isCustom || isValidCustomUrl
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Tunnel DNS") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text(
-                    "DNS used inside the VPN tunnel for all app and browsing traffic.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 8.dp),
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = { Text(summary) },
+        trailingContent = { Switch(checked = checked, onCheckedChange = null, enabled = enabled) },
+        modifier =
+            Modifier.toggleable(
+                    value = checked,
+                    enabled = enabled,
+                    role = Role.Switch,
+                    onValueChange = onCheckedChange,
                 )
-                SettingsStore.DnsProvider.entries.forEach { provider ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(
-                                selected = selectedProvider == provider,
-                                onClick = { selectedProvider = provider },
-                            )
-                            .padding(vertical = 4.dp),
-                    ) {
-                        RadioButton(
-                            selected = selectedProvider == provider,
-                            onClick = { selectedProvider = provider },
-                        )
-                        Column(Modifier.padding(start = 8.dp)) {
-                            Text(provider.label)
-                            val detail = when (provider) {
-                                SettingsStore.DnsProvider.SYSTEM_DEFAULT -> "Resolved at the VPN edge"
-                                SettingsStore.DnsProvider.CUSTOM -> "Specify an HTTPS DoH endpoint URL"
-                                else -> provider.dohUrl ?: ""
-                            }
-                            if (detail.isNotEmpty()) {
-                                Text(
-                                    detail,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    }
-                }
-                if (isCustom) {
-                    OutlinedTextField(
-                        value = urlText,
-                        onValueChange = { urlText = it.trim() },
-                        label = { Text("DoH URL (https://...)") },
-                        placeholder = { Text("https://example.com/dns-query") },
-                        singleLine = true,
-                        isError = urlText.isNotBlank() && !isValidCustomUrl,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onConfirm(selectedProvider, urlText) },
-                enabled = canSave,
-            ) {
-                Text("Save")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun BootstrapDnsPickerDialog(
-    currentProvider: SettingsStore.BootstrapDnsProvider,
-    currentCustomIp: String,
-    onDismiss: () -> Unit,
-    onConfirm: (SettingsStore.BootstrapDnsProvider, String) -> Unit,
-) {
-    var selectedProvider by remember { mutableStateOf(currentProvider) }
-    var ipText by remember { mutableStateOf(currentCustomIp) }
-    val isCustom = selectedProvider == SettingsStore.BootstrapDnsProvider.CUSTOM
-    val isValidCustomIp = SettingsStore.isValidIpAddress(ipText.trim())
-    val canSave = !isCustom || isValidCustomIp
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Resolver DNS") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text(
-                    "DNS used to resolve the VPN server address before the tunnel connects.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-                SettingsStore.BootstrapDnsProvider.entries.forEach { provider ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(
-                                selected = selectedProvider == provider,
-                                onClick = { selectedProvider = provider },
-                            )
-                            .padding(vertical = 4.dp),
-                    ) {
-                        RadioButton(
-                            selected = selectedProvider == provider,
-                            onClick = { selectedProvider = provider },
-                        )
-                        Column(Modifier.padding(start = 8.dp)) {
-                            Text(provider.label)
-                            Text(
-                                provider.description,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
-                if (isCustom) {
-                    OutlinedTextField(
-                        value = ipText,
-                        onValueChange = { ipText = it.trim() },
-                        label = { Text("Resolver IP address") },
-                        placeholder = { Text("e.g. 76.76.2.2") },
-                        singleLine = true,
-                        isError = ipText.isNotBlank() && !isValidCustomIp,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onConfirm(selectedProvider, ipText.trim()) },
-                enabled = canSave,
-            ) {
-                Text("Save")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun CustomEdgeAddressDialog(
-    current: String,
-    onDismiss: () -> Unit,
-    onConfirm: (String) -> Unit,
-) {
-    var value by remember { mutableStateOf(current) }
-    val trimmed = value.trim()
-    val isValid = trimmed.isEmpty() || SettingsStore.isValidEdgeHost(trimmed)
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Custom edge address") },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = { value = it },
-                    label = { Text("Host or IP") },
-                    singleLine = true,
-                    isError = !isValid,
-                )
-                Text(
-                    "Leave empty to resolve the server hostname normally.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(trimmed) }, enabled = isValid) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun SocksBindAddressPickerDialog(
-    current: String,
-    onDismiss: () -> Unit,
-    onConfirm: (String) -> Unit,
-) {
-    var selected by remember { mutableStateOf(current) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Local address") },
-        text = {
-            Column {
-                SettingsStore.SOCKS_BIND_ADDRESS_PRESETS.forEach { (address, label) ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(selected = selected == address, onClick = { selected = address })
-                            .padding(vertical = 4.dp),
-                    ) {
-                        RadioButton(selected = selected == address, onClick = { selected = address })
-                        Text(label, modifier = Modifier.padding(start = 8.dp))
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(selected) }) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun SocksPortPickerDialog(
-    current: Int,
-    onDismiss: () -> Unit,
-    onConfirm: (Int) -> Unit,
-) {
-    var portText by remember { mutableStateOf(current.toString()) }
-    val parsedPort = portText.toIntOrNull()
-    val isValid = parsedPort != null && parsedPort in 1..65_535
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Local port") },
-        text = {
-            OutlinedTextField(
-                value = portText,
-                onValueChange = { portText = it.filter(Char::isDigit).take(5) },
-                label = { Text("Port (1\u201365535)") },
-                singleLine = true,
-                isError = portText.isNotBlank() && !isValid,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            )
-        },
-        confirmButton = {
-            TextButton(onClick = { parsedPort?.let { onConfirm(it) } }, enabled = isValid) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun HttpPortPickerDialog(
-    current: Int,
-    onDismiss: () -> Unit,
-    onConfirm: (Int) -> Unit,
-) {
-    var portText by remember { mutableStateOf(current.toString()) }
-    val parsedPort = portText.toIntOrNull()
-    val isValid = parsedPort != null && parsedPort in 1..65_535
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("HTTP port") },
-        text = {
-            OutlinedTextField(
-                value = portText,
-                onValueChange = { portText = it.filter(Char::isDigit).take(5) },
-                label = { Text("Port (1\u201365535)") },
-                singleLine = true,
-                isError = portText.isNotBlank() && !isValid,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            )
-        },
-        confirmButton = {
-            TextButton(onClick = { parsedPort?.let { onConfirm(it) } }, enabled = isValid) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun UpstreamProxyTypePickerDialog(
-    current: SettingsStore.UpstreamProxyType,
-    onDismiss: () -> Unit,
-    onConfirm: (SettingsStore.UpstreamProxyType) -> Unit,
-) {
-    var selected by remember { mutableStateOf(current) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Proxy type") },
-        text = {
-            Column {
-                SettingsStore.UpstreamProxyType.entries.forEach { type ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(selected = selected == type, onClick = { selected = type })
-                            .padding(vertical = 4.dp),
-                    ) {
-                        RadioButton(selected = selected == type, onClick = { selected = type })
-                        Text(type.name, modifier = Modifier.padding(start = 8.dp))
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(selected) }) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun TlsSplitModePickerDialog(
-    current: SettingsStore.TlsSplitMode,
-    onDismiss: () -> Unit,
-    onConfirm: (SettingsStore.TlsSplitMode) -> Unit,
-) {
-    var selected by remember { mutableStateOf(current) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("TLS fragmentation") },
-        text = {
-            Column {
-                Text(
-                    "Fragments the TLS ClientHello into multiple TCP packets to bypass SNI-based filtering on censored networks.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 12.dp),
-                )
-                SettingsStore.TlsSplitMode.entries.forEach { mode ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(selected = selected == mode, onClick = { selected = mode })
-                            .padding(vertical = 6.dp),
-                    ) {
-                        RadioButton(selected = selected == mode, onClick = { selected = mode })
-                        Column(Modifier.padding(start = 8.dp)) {
-                            Text(mode.label, style = MaterialTheme.typography.bodyLarge)
-                            Text(
-                                mode.description,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(selected) }) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun UpstreamProxyAddressDialog(
-    currentHost: String,
-    currentPort: Int,
-    onDismiss: () -> Unit,
-    onConfirm: (String, Int) -> Unit,
-) {
-    var host by remember { mutableStateOf(currentHost) }
-    var portText by remember { mutableStateOf(currentPort.toString()) }
-    val parsedPort = portText.toIntOrNull()
-    val isValid = host.isNotBlank() && parsedPort != null && parsedPort in 1..65_535
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Proxy address") },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = host,
-                    onValueChange = { host = it.trim() },
-                    label = { Text("Host or IP") },
-                    singleLine = true,
-                )
-                OutlinedTextField(
-                    value = portText,
-                    onValueChange = { portText = it.filter(Char::isDigit).take(5) },
-                    label = { Text("Port (1\u201365535)") },
-                    singleLine = true,
-                    isError = portText.isNotBlank() && (parsedPort == null || parsedPort !in 1..65_535),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { parsedPort?.let { onConfirm(host, it) } }, enabled = isValid) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-@Composable
-private fun UpstreamProxyCredentialsDialog(
-    currentUsername: String,
-    currentPassword: String,
-    onDismiss: () -> Unit,
-    onConfirm: (String, String) -> Unit,
-) {
-    var username by remember { mutableStateOf(currentUsername) }
-    var password by remember { mutableStateOf(currentPassword) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Proxy credentials") },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = username,
-                    onValueChange = { username = it },
-                    label = { Text("Username (optional)") },
-                    singleLine = true,
-                )
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    label = { Text("Password (optional)") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.padding(top = 8.dp),
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(username, password) }) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
-}
-
-private data class InstalledAppEntry(val packageName: String, val label: String)
-
-@Composable
-private fun SplitTunnelDialog(
-    current: Set<String>,
-    onDismiss: () -> Unit,
-    onConfirm: (Set<String>) -> Unit,
-) {
-    val context = LocalContext.current
-    var selected by remember { mutableStateOf(current) }
-    var searchQuery by remember { mutableStateOf("") }
-
-    val installedApps by produceState<List<InstalledAppEntry>>(initialValue = emptyList()) {
-        value = withContext(Dispatchers.IO) {
-            val packageManager = context.packageManager
-            packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-                .asSequence()
-                .filter { it.packageName != context.packageName }
-                .filter { packageManager.getLaunchIntentForPackage(it.packageName) != null }
-                .map { info: ApplicationInfo ->
-                    InstalledAppEntry(info.packageName, info.loadLabel(packageManager).toString())
-                }
-                .sortedBy { it.label.lowercase() }
-                .toList()
-        }
-    }
-    val filteredApps = remember(installedApps, searchQuery) {
-        if (searchQuery.isBlank()) {
-            installedApps
-        } else {
-            installedApps.filter { it.label.contains(searchQuery, ignoreCase = true) }
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Split tunneling") },
-        text = {
-            Column {
-                Text(
-                    "Selected apps bypass the VPN and use your normal connection.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    label = { Text("Search apps") },
-                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp),
-                )
-                if (installedApps.isEmpty()) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.padding(24.dp).align(Alignment.CenterHorizontally)
-                    )
-                } else if (filteredApps.isEmpty()) {
-                    Text(
-                        "No apps match \"$searchQuery\".",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 12.dp),
-                    )
-                } else {
-                    LazyColumn(modifier = Modifier.height(360.dp)) {
-                        items(filteredApps, key = { it.packageName }) { app ->
-                            val isChecked = selected.contains(app.packageName)
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        selected = if (isChecked) {
-                                            selected - app.packageName
-                                        } else {
-                                            selected + app.packageName
-                                        }
-                                    }
-                                    .padding(vertical = 2.dp),
-                            ) {
-                                Checkbox(
-                                    checked = isChecked,
-                                    onCheckedChange = {
-                                        selected = if (it) selected + app.packageName else selected - app.packageName
-                                    },
-                                )
-                                Text(app.label, modifier = Modifier.padding(start = 8.dp))
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(selected) }) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
+                .heightIn(min = 48.dp),
     )
 }
 
@@ -1060,52 +657,5 @@ private fun SectionLabel(text: String) {
         style = MaterialTheme.typography.labelLarge,
         color = MaterialTheme.colorScheme.primary,
         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-    )
-}
-
-@Composable
-private fun MtuPickerDialog(
-    current: Int,
-    onDismiss: () -> Unit,
-    onConfirm: (Int) -> Unit,
-) {
-    var mtuText by remember { mutableStateOf(current.toString()) }
-    val parsedMtu = mtuText.toIntOrNull()
-    val isValid = parsedMtu != null && parsedMtu in SettingsStore.MIN_MTU..SettingsStore.MAX_MTU
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Tunnel MTU") },
-        text = {
-            Column {
-                Text(
-                    "Maximum Transmission Unit for the VPN tunnel. Default is ${SettingsStore.DEFAULT_MTU}. Lower values (e.g. 1280\u20131400) prevent packet fragmentation on mobile networks.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 12.dp),
-                )
-                OutlinedTextField(
-                    value = mtuText,
-                    onValueChange = { mtuText = it.filter(Char::isDigit).take(4) },
-                    label = { Text("MTU (${SettingsStore.MIN_MTU}\u2013${SettingsStore.MAX_MTU})") },
-                    singleLine = true,
-                    isError = mtuText.isNotBlank() && !isValid,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                TextButton(
-                    onClick = { mtuText = SettingsStore.DEFAULT_MTU.toString() },
-                    modifier = Modifier.align(Alignment.End),
-                ) {
-                    Text("Reset to default (${SettingsStore.DEFAULT_MTU})")
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { parsedMtu?.let { onConfirm(it) } }, enabled = isValid) { Text("Save") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
     )
 }

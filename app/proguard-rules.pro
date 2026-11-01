@@ -1,25 +1,18 @@
--dontwarn io.netty.**
--keep class io.netty.** { *; }
-
--keep class com.vauth.foxyvpn.vpn.tun.HevSocks5Tunnel { *; }
--keepnames class com.vauth.foxyvpn.vpn.tun.HevSocks5Tunnel
 -keepclasseswithmembernames class * {
     native <methods>;
 }
 
--keep class org.conscrypt.** { *; }
--dontwarn org.conscrypt.**
+-keep class io.nekohasekai.libbox.** { *; }
+-dontwarn io.nekohasekai.libbox.**
 
--dontwarn io.netty.internal.tcnative.**
--dontwarn io.netty.handler.ssl.OpenSsl**
+-keep class go.** { *; }
+-dontwarn go.**
 
--keepclasseswithmembers class * {
-    kotlinx.serialization.KSerializer serializer(...);
-}
-
--dontwarn com.google.errorprone.annotations.**
-
--dontwarn reactor.blockhound.**
+-keep class * implements io.nekohasekai.libbox.PlatformInterface { *; }
+-keep class * implements io.nekohasekai.libbox.CommandServerHandler { *; }
+-keep class * implements io.nekohasekai.libbox.CommandClientHandler { *; }
+-keep class * implements io.nekohasekai.libbox.AutoRedirectHandler { *; }
+-keep class com.vauth.foxyvpn.vpn.FoxyPlatformInterface { *; }
 
 -keepattributes JavascriptInterface, *Annotation*
 
@@ -27,3 +20,11 @@
 -keepclassmembers class * {
     @android.webkit.JavascriptInterface <methods>;
 }
+
+-keep class com.vauth.foxyvpn.data.** { *; }
+-keepclassmembers class * extends androidx.lifecycle.ViewModel {
+    <init>(...);
+}
+-keep class com.vauth.foxyvpn.vpn.IpLocationInfo { *; }
+-keep class com.vauth.foxyvpn.vpn.VpnLiveStats { *; }
+

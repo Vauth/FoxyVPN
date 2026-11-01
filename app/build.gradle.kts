@@ -2,33 +2,10 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
-    id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-val hevSocks5TunnelVersion = "2.17.1"
-val hevSocks5TunnelDir = file("src/main/jni")
-
-val fetchHevSocks5Tunnel = tasks.register<Exec>("fetchHevSocks5Tunnel") {
-    val marker = File(hevSocks5TunnelDir, "Android.mk")
-    outputs.file(marker)
-    onlyIf { !marker.exists() }
-    doFirst { hevSocks5TunnelDir.mkdirs() }
-    commandLine(
-        "git", "clone",
-        "--branch", hevSocks5TunnelVersion,
-        "--depth", "1",
-        "--recursive",
-        "--shallow-submodules",
-        "https://github.com/heiher/hev-socks5-tunnel.git",
-        hevSocks5TunnelDir.absolutePath,
-    )
-}
-
-tasks.matching { it.name.startsWith("externalNativeBuild") || it.name.contains("NdkBuild") }
-    .configureEach { dependsOn(fetchHevSocks5Tunnel) }
-tasks.named("preBuild").configure { dependsOn(fetchHevSocks5Tunnel) }
-
-val releaseKeystoreFile = rootProject.file("release-keystore.jks")
+val releaseKeystoreFile = System.getenv("SIGNING_KEYSTORE_PATH")?.let { file(it) }
+    ?: rootProject.file("release-keystore.jks")
 val releaseKeyAlias: String? = System.getenv("SIGNING_KEY_ALIAS")
 val releaseKeyPassword: String? = System.getenv("SIGNING_KEY_PASSWORD")
 val releaseStorePassword: String? = System.getenv("SIGNING_STORE_PASSWORD")
@@ -40,32 +17,22 @@ val hasReleaseSigning = releaseKeystoreFile.exists() &&
 android {
     namespace = "com.vauth.foxyvpn"
     compileSdk = 35
-
-    ndkVersion = "26.1.10909125"
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "com.vauth.foxyvpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 45
-        versionName = "1.0.8"
-
-        externalNativeBuild {
-            ndkBuild {
-                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
-                arguments += listOf(
-
-                    "APP_PLATFORM=android-26",
-
-                    "APP_CFLAGS=-DPKGNAME=com/vauth/foxyvpn/vpn/tun -DCLSNAME=HevSocks5Tunnel",
-                )
-            }
-        }
+        versionCode = 46
+        versionName = "2.0.0"
     }
 
-    externalNativeBuild {
-        ndkBuild {
-            path = file("src/main/jni/Android.mk")
+    splits {
+        abi {
+            isEnable = true
+            isUniversalApk = true
+            reset()
+            include("armeabi-v7a", "arm64-v8a")
         }
     }
 
@@ -98,6 +65,7 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        allWarningsAsErrors = true
         freeCompilerArgs += listOf(
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
             "-opt-in=androidx.compose.material3.ExperimentalMaterial3ExpressiveApi",
@@ -110,20 +78,26 @@ android {
     }
 
     lint {
-        checkReleaseBuilds = false
-        abortOnError = false
+        checkReleaseBuilds = true
+        abortOnError = true
     }
 
     packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols.add("**/libbox.so")
+            keepDebugSymbols.add("**/libandroidx.graphics.path.so")
+        }
         resources.excludes.add("META-INF/INDEX.LIST")
         resources.excludes.add("META-INF/*.SF")
         resources.excludes.add("META-INF/*.DSA")
         resources.excludes.add("META-INF/*.RSA")
-        resources.pickFirsts.add("META-INF/io.netty.versions.properties")
     }
 }
 
 dependencies {
+    implementation(files("libs/libbox.aar"))
+
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
@@ -131,26 +105,18 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.4.0-alpha10")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.3")
-    implementation("androidx.navigation:navigation-compose:2.8.5")
+    implementation("androidx.navigation:navigation-compose:2.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.core:core-ktx:1.15.0")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("androidx.security:security-crypto:1.1.0")
 
-    implementation("io.netty:netty-handler:4.1.115.Final")
-    implementation("io.netty:netty-codec-http2:4.1.115.Final")
-    implementation("io.netty:netty-transport:4.1.115.Final")
+    implementation("com.google.errorprone:error_prone_annotations:2.27.0")
 
-    implementation("io.netty:netty-handler-proxy:4.1.115.Final")
-
-    implementation("org.conscrypt:conscrypt-android:2.5.2")
-
-    testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.2.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

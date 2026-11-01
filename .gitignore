@@ -13,4 +13,7 @@ app/build/
 *.keystore
 *.jks
 keystore.properties
-app/src/main/jni/
+app/libs/*.aar
+
+
+.kotlin/
