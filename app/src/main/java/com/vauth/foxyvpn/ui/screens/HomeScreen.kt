@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -43,105 +44,105 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import com.vauth.foxyvpn.FoxyVpnApp
-import com.vauth.foxyvpn.data.GUARDIAN_ENDPOINT_DEFAULT
-import com.vauth.foxyvpn.data.RECOMMENDED_COUNTRY_CODE
-import com.vauth.foxyvpn.data.ServerListClient
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.vauth.foxyvpn.R
+import com.vauth.foxyvpn.data.ProxyStateStore
+import com.vauth.foxyvpn.data.ThemeMode
 import com.vauth.foxyvpn.data.formatBytes
 import com.vauth.foxyvpn.data.model.ConnectionState
+import com.vauth.foxyvpn.data.model.displayName
 import com.vauth.foxyvpn.data.model.emojiFlag
+import com.vauth.foxyvpn.ui.HomeViewModel
 import com.vauth.foxyvpn.ui.theme.LocalFoxyStatusColors
 import com.vauth.foxyvpn.ui.theme.ThemeController
-import com.vauth.foxyvpn.ui.theme.ThemeMode
-import com.vauth.foxyvpn.vpn.ExitCheck
 import com.vauth.foxyvpn.vpn.FoxyVpnService
 import com.vauth.foxyvpn.vpn.IpLocationInfo
-import com.vauth.foxyvpn.vpn.PingUtil
+import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import java.util.Locale
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun HomeScreen(
-    app: FoxyVpnApp,
+    proxyStateStore: ProxyStateStore,
+    homeModel: HomeViewModel,
     themeController: ThemeController,
     onRequestConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onOpenServers: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
-    val state by FoxyVpnService.state.collectAsState()
-    val lastError by FoxyVpnService.lastError.collectAsState()
-    val liveStats by FoxyVpnService.vpnLiveStats.collectAsState()
-    val connectedAtEpochMs by FoxyVpnService.connectedAtEpochMs.collectAsState()
-    val pingLatency by FoxyVpnService.pingLatencyMs.collectAsState()
-    val vpnEdgeIp by FoxyVpnService.vpnEdgeIp.collectAsState()
+    val state by FoxyVpnService.state.collectAsStateWithLifecycle()
+    val proxyOnlyActive by FoxyVpnService.proxyOnlyActive.collectAsStateWithLifecycle()
+    val lastError by FoxyVpnService.lastError.collectAsStateWithLifecycle()
+    val liveStats by FoxyVpnService.vpnLiveStats.collectAsStateWithLifecycle()
+    val connectedAtElapsedMs by FoxyVpnService.connectedAtElapsedMs.collectAsStateWithLifecycle()
+    val pingLatency by FoxyVpnService.pingLatencyMs.collectAsStateWithLifecycle()
+    val vpnEdgeIp by FoxyVpnService.vpnEdgeIp.collectAsStateWithLifecycle()
+    val isPinging by homeModel.isPinging.collectAsStateWithLifecycle()
 
-    val selectedProxy by app.proxyStateStore.selectedProxyFlow.collectAsState()
+    val selectedProxy by proxyStateStore.selectedProxyFlow.collectAsStateWithLifecycle()
+    val activeProxy by FoxyVpnService.activeCandidate.collectAsStateWithLifecycle()
+    val displayProxy =
+        if (state == ConnectionState.DISCONNECTED) selectedProxy else activeProxy ?: selectedProxy
 
     val statusColors = LocalFoxyStatusColors.current
-    val targetRingColor = when (state) {
-        ConnectionState.CONNECTED -> statusColors.connected
-        ConnectionState.CONNECTING -> statusColors.connecting
-        ConnectionState.DISCONNECTED -> MaterialTheme.colorScheme.outline
-    }
+    val targetRingColor =
+        when (state) {
+            ConnectionState.CONNECTED -> statusColors.connected
+            ConnectionState.CONNECTING -> statusColors.connecting
+            ConnectionState.DISCONNECTED -> MaterialTheme.colorScheme.outline
+        }
 
-    val ringColor by animateColorAsState(targetValue = targetRingColor, label = "connect-ring-color")
-    val scale by animateFloatAsState(
-        targetValue = if (state == ConnectionState.CONNECTED) 1f else 0.92f,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
-        label = "connect-scale",
-    )
+    val ringColor by
+        animateColorAsState(targetValue = targetRingColor, label = "connect-ring-color")
+    val scale by
+        animateFloatAsState(
+            targetValue = if (state == ConnectionState.CONNECTED) 1f else 0.92f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+            label = "connect-scale",
+        )
 
     val systemInDarkTheme = isSystemInDarkTheme()
     val haptics = LocalHapticFeedback.current
-    val scope = rememberCoroutineScope()
 
     var elapsedSeconds by remember { mutableLongStateOf(0L) }
-    var realIp by remember {
-        mutableStateOf<IpLocationInfo?>(
-            app.settingsStore.cachedRealIp?.let {
-                IpLocationInfo(it, app.settingsStore.cachedRealCountry.orEmpty())
-            },
-        )
+    val account by homeModel.account.collectAsStateWithLifecycle()
+    val realIp = account.realIp?.let { IpLocationInfo(it, account.country.orEmpty()) }
+    val quotaRemaining = account.quotaRemaining
+    val quotaMax = account.quotaMax
+    val isUnlimited = account.unlimited
+
+    LaunchedEffect(Unit) {
+        homeModel.refreshAccount()
     }
-    var isPinging by remember { mutableStateOf(false) }
-    var disconnectedPingLatency by remember { mutableStateOf<Int?>(null) }
-    var quotaRemaining by remember { mutableStateOf(app.settingsStore.cachedQuotaRemaining) }
-    var quotaMax by remember { mutableStateOf(app.settingsStore.cachedQuotaMax) }
-    var isUnlimited by remember { mutableStateOf(app.settingsStore.cachedIsUnlimited) }
 
     LaunchedEffect(state) {
         if (state == ConnectionState.CONNECTED) {
-            quotaRemaining = app.settingsStore.cachedQuotaRemaining
-            quotaMax = app.settingsStore.cachedQuotaMax
-            isUnlimited = app.settingsStore.cachedIsUnlimited
+            homeModel.refreshAccount()
         }
     }
 
-    LaunchedEffect(state, connectedAtEpochMs) {
-        if (state == ConnectionState.CONNECTED && connectedAtEpochMs != null) {
+    LaunchedEffect(state, connectedAtElapsedMs) {
+        val startEpoch = connectedAtElapsedMs
+        if (state == ConnectionState.CONNECTED && startEpoch != null) {
             while (isActive) {
-                val now = System.currentTimeMillis()
-                elapsedSeconds = ((now - connectedAtEpochMs!!) / 1000L).coerceAtLeast(0L)
+                val now = android.os.SystemClock.elapsedRealtime()
+                elapsedSeconds = ((now - startEpoch) / 1000L).coerceAtLeast(0L)
                 delay(1000L)
             }
         } else {
@@ -149,86 +150,63 @@ fun HomeScreen(
         }
     }
 
-    LaunchedEffect(Unit) {
-        launch {
-            ExitCheck().fetchDirectIpInfo().onSuccess { info ->
-                realIp = info
-                app.settingsStore.cachedRealIp = info.ip
-                app.settingsStore.cachedRealCountry = info.countryCode
-            }
-        }
-        launch {
-            val token = app.authRepository.currentAccessToken()
-            if (token != null) {
-                runCatching { app.guardianClient.fetchUserInfo(GUARDIAN_ENDPOINT_DEFAULT, token) }
-                    .onSuccess { entitlement ->
-                        val unlimited = !entitlement.limitedBandwidth
-                        isUnlimited = unlimited
-                        app.settingsStore.cachedIsUnlimited = unlimited
-                        entitlement.quotaRemaining?.let {
-                            quotaRemaining = it
-                            app.settingsStore.cachedQuotaRemaining = it
-                        }
-                        entitlement.maxBytes?.let {
-                            quotaMax = it
-                            app.settingsStore.cachedQuotaMax = it
-                        }
-                    }
-            }
-        }
-    }
-
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("FoxyVPN") },
+                title = { Text(stringResource(R.string.app_name)) },
                 actions = {
                     val mode = themeController.mode
                     val showingDark = themeController.resolveDark(systemInDarkTheme)
                     Box(
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .combinedClickable(
-                                role = Role.Button,
-                                onClick = { themeController.toggle(systemInDarkTheme) },
-                                onLongClick = {
-                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    themeController.set(ThemeMode.SYSTEM)
-                                },
-                            ),
+                        modifier =
+                            Modifier.size(48.dp)
+                                .clip(CircleShape)
+                                .combinedClickable(
+                                    role = Role.Button,
+                                    onClick = { themeController.toggle(systemInDarkTheme) },
+                                    onLongClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        themeController.set(ThemeMode.SYSTEM)
+                                    },
+                                ),
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(
-                            imageVector = when (mode) {
-                                ThemeMode.SYSTEM -> Icons.Filled.BrightnessAuto
-                                ThemeMode.LIGHT -> Icons.Filled.LightMode
-                                ThemeMode.DARK -> Icons.Filled.DarkMode
-                            },
-                            contentDescription = when (mode) {
-                                ThemeMode.SYSTEM ->
-                                    "Theme: follow system. Tap to switch to ${if (showingDark) "light" else "dark"} mode"
-                                ThemeMode.LIGHT -> "Theme: light. Tap for dark mode, long press to follow the system"
-                                ThemeMode.DARK -> "Theme: dark. Tap for light mode, long press to follow the system"
-                            },
+                            imageVector =
+                                when (mode) {
+                                    ThemeMode.SYSTEM -> Icons.Filled.BrightnessAuto
+                                    ThemeMode.LIGHT -> Icons.Filled.LightMode
+                                    ThemeMode.DARK -> Icons.Filled.DarkMode
+                                },
+                            contentDescription =
+                                when (mode) {
+                                    ThemeMode.SYSTEM ->
+                                        if (showingDark) {
+                                            stringResource(R.string.theme_desc_system_light)
+                                        } else {
+                                            stringResource(R.string.theme_desc_system_dark)
+                                        }
+                                    ThemeMode.LIGHT ->
+                                        stringResource(R.string.theme_desc_light)
+                                    ThemeMode.DARK ->
+                                        stringResource(R.string.theme_desc_dark)
+                                },
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(
                             imageVector = Icons.Filled.Settings,
-                            contentDescription = "Settings",
+                            contentDescription = stringResource(R.string.settings_title),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 },
             )
-        },
+        }
     ) { padding ->
         BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
+            modifier = Modifier.fillMaxSize().padding(padding),
             contentAlignment = Alignment.TopCenter,
         ) {
             val scrollState = rememberScrollState()
@@ -238,35 +216,38 @@ fun HomeScreen(
             val dynamicSpace = if (availableExtra > 0.dp) (availableExtra / 2) else 16.dp
 
             Column(
-                modifier = Modifier
-                    .widthIn(max = 520.dp)
-                    .fillMaxWidth()
-                    .verticalScroll(scrollState, enabled = scrollState.maxValue > 0)
-                    .padding(horizontal = 20.dp),
+                modifier =
+                    Modifier.widthIn(max = 520.dp)
+                        .fillMaxWidth()
+                        .verticalScroll(scrollState, enabled = scrollState.maxValue > 0)
+                        .padding(horizontal = 20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Spacer(Modifier.height(dynamicSpace))
 
                 Box(
-                    modifier = Modifier
-                        .size(180.dp)
-                        .clip(CircleShape)
-                        .background(ringColor.copy(alpha = 0.15f))
-                        .clickable {
-                            if (state == ConnectionState.DISCONNECTED) onRequestConnect() else onDisconnect()
-                        },
+                    modifier =
+                        Modifier.size(180.dp)
+                            .clip(CircleShape)
+                            .background(ringColor.copy(alpha = 0.15f))
+                            .clickable(role = Role.Button) {
+                                if (state == ConnectionState.DISCONNECTED) onRequestConnect()
+                                else onDisconnect()
+                            },
                     contentAlignment = Alignment.Center,
                 ) {
                     Box(
-                        modifier = Modifier
-                            .size((140 * scale).dp)
-                            .clip(CircleShape)
-                            .background(ringColor.copy(alpha = 0.25f)),
+                        modifier =
+                            Modifier.size((140 * scale).dp)
+                                .clip(CircleShape)
+                                .background(ringColor.copy(alpha = 0.25f)),
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Power,
-                            contentDescription = if (state == ConnectionState.DISCONNECTED) "Connect" else "Disconnect",
+                            contentDescription =
+                                if (state == ConnectionState.DISCONNECTED) "Connect"
+                                else "Disconnect",
                             tint = ringColor,
                             modifier = Modifier.size(56.dp),
                         )
@@ -276,26 +257,31 @@ fun HomeScreen(
                 Spacer(Modifier.height(heroGap))
 
                 Text(
-                    text = when (state) {
-                        ConnectionState.CONNECTED -> "Connected"
-                        ConnectionState.CONNECTING -> "Connecting\u2026"
-                        ConnectionState.DISCONNECTED -> "Disconnected"
-                    },
-                    style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
+                    text =
+                        when (state) {
+                            ConnectionState.CONNECTED -> "Connected"
+                            ConnectionState.CONNECTING -> "Connecting\u2026"
+                            ConnectionState.DISCONNECTED -> "Disconnected"
+                        },
+                    style =
+                        MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
                 )
 
                 Spacer(Modifier.height(4.dp))
 
                 if (state == ConnectionState.CONNECTING) {
                     Text(
-                        "Tap to cancel",
+                        if (lastError != null) "Retrying connection\u2026 Tap to cancel" else "Tap to cancel",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
                     Text(
-                        text = if (state == ConnectionState.CONNECTED) formatDuration(elapsedSeconds) else "00:00:00",
-                        style = MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings = "tnum"),
+                        text =
+                            if (state == ConnectionState.CONNECTED) formatDuration(elapsedSeconds)
+                            else "00:00:00",
+                        style =
+                            MaterialTheme.typography.bodyMedium.copy(fontFeatureSettings = "tnum"),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -308,9 +294,7 @@ fun HomeScreen(
                         textAlign = TextAlign.Center,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                     )
                 }
 
@@ -320,7 +304,10 @@ fun HomeScreen(
                     onClick = onOpenServers,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                    colors =
+                        CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                        ),
                 ) {
                     Column(Modifier.padding(16.dp)) {
                         Text(
@@ -330,16 +317,33 @@ fun HomeScreen(
                         )
                         Spacer(Modifier.padding(top = 4.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            val flag = selectedProxy?.emojiFlag
+                            val flag = displayProxy?.emojiFlag
                             if (!flag.isNullOrBlank()) {
                                 Text(flag, style = MaterialTheme.typography.titleMedium)
                             } else {
                                 Icon(imageVector = Icons.Filled.Public, contentDescription = null)
                             }
                             Spacer(Modifier.padding(start = 8.dp))
+                            val displayName =
+                                displayProxy?.displayName?.ifBlank { displayProxy.countryCode }
+                                    ?: stringResource(R.string.home_recommended)
                             Text(
-                                selectedProxy?.let { it.countryName.ifBlank { it.countryCode } } ?: "Recommended",
+                                displayName,
                                 style = MaterialTheme.typography.bodyLarge,
+                            )
+                        }
+                        if (
+                            state != ConnectionState.DISCONNECTED &&
+                                activeProxy != null &&
+                                selectedProxy != null &&
+                                activeProxy != selectedProxy
+                        ) {
+                            val nextDisplayName =
+                                selectedProxy?.displayName?.ifBlank { selectedProxy?.countryCode.orEmpty() }.orEmpty()
+                            Text(
+                                stringResource(R.string.home_next_connection, nextDisplayName),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
@@ -350,22 +354,25 @@ fun HomeScreen(
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                    colors =
+                        CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                        ),
                 ) {
                     Column(Modifier.padding(16.dp)) {
                         val isConnected = state == ConnectionState.CONNECTED
-                        val ipDisplay = if (isConnected) {
-                            vpnEdgeIp?.let {
-                                if (it.countryCode.isNotEmpty()) "${it.ip} • ${it.countryCode}" else it.ip
-                            } ?: "Checking\u2026"
-                        } else {
-                            realIp?.let {
-                                if (it.countryCode.isNotEmpty()) "${it.ip} • ${it.countryCode}" else it.ip
-                            } ?: app.settingsStore.cachedRealIp?.let { cachedIp ->
-                                val cachedCountry = app.settingsStore.cachedRealCountry
-                                if (!cachedCountry.isNullOrEmpty()) "$cachedIp • $cachedCountry" else cachedIp
-                            } ?: "Checking\u2026"
-                        }
+                        val ipDisplay =
+                            if (isConnected) {
+                                vpnEdgeIp?.let {
+                                    if (it.countryCode.isNotEmpty()) "${it.ip} • ${it.countryCode}"
+                                    else it.ip
+                                } ?: "\u2014"
+                            } else {
+                                realIp?.let {
+                                    if (it.countryCode.isNotEmpty()) "${it.ip} • ${it.countryCode}"
+                                    else it.ip
+                                } ?: "\u2014"
+                            }
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -380,22 +387,32 @@ fun HomeScreen(
                                 Spacer(Modifier.height(2.dp))
                                 Text(
                                     ipDisplay,
-                                    style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Bold),
+                                    style =
+                                        MaterialTheme.typography.bodyLarge.copy(
+                                            fontWeight = FontWeight.Bold
+                                        ),
                                     color = MaterialTheme.colorScheme.onSurface,
                                 )
                             }
                             Spacer(Modifier.width(8.dp))
-                            val badgeColor = if (isConnected) statusColors.connected else MaterialTheme.colorScheme.error
+                            val badgeColor =
+                                if (isConnected) statusColors.connected
+                                else MaterialTheme.colorScheme.error
                             val badgeBg = badgeColor.copy(alpha = 0.15f)
                             Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(badgeBg)
-                                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                                modifier =
+                                    Modifier.clip(RoundedCornerShape(6.dp))
+                                        .background(badgeBg)
+                                        .padding(horizontal = 10.dp, vertical = 4.dp)
                             ) {
                                 Text(
-                                    if (isConnected) "Protected" else "Exposed",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    if (isConnected) {
+                                        if (proxyOnlyActive) "Proxy active" else "Protected"
+                                    } else "Exposed",
+                                    style =
+                                        MaterialTheme.typography.labelSmall.copy(
+                                            fontWeight = FontWeight.Bold
+                                        ),
                                     color = badgeColor,
                                 )
                             }
@@ -408,7 +425,10 @@ fun HomeScreen(
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                    colors =
+                        CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                        ),
                 ) {
                     Column(Modifier.padding(16.dp)) {
                         val isConnected = state == ConnectionState.CONNECTED
@@ -427,54 +447,51 @@ fun HomeScreen(
                                 )
                                 Spacer(Modifier.height(2.dp))
                                 Text(
-                                    if (isConnected) formatBytes(liveStats.sessionBytes) else "0.0 MB",
-                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                    if (isConnected) formatBytes(liveStats.sessionBytes)
+                                    else "0.0 MB",
+                                    style =
+                                        MaterialTheme.typography.titleMedium.copy(
+                                            fontWeight = FontWeight.Bold
+                                        ),
                                     color = MaterialTheme.colorScheme.onSurface,
                                 )
                             }
                             Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable(role = Role.Button) {
-                                        if (!isPinging) {
-                                            scope.launch {
-                                                isPinging = true
-                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                if (state == ConnectionState.CONNECTED) {
-                                                    FoxyVpnService.pingNow()
-                                                } else {
-                                                    val target = selectedProxy ?: app.proxyStateStore.load() ?: run {
-                                                        val cached = app.serverListClient.loadCachedCountries()
-                                                        ServerListClient.candidatesForCountry(cached, RECOMMENDED_COUNTRY_CODE).firstOrNull()
-                                                            ?: cached.firstOrNull { it.code.isNotBlank() }?.let { country ->
-                                                                ServerListClient.candidatesForCountry(cached, country.code).firstOrNull()
-                                                            }
-                                                    }
-                                                    if (target != null) {
-                                                        disconnectedPingLatency = PingUtil.measureTcpLatencyMs(target.host, target.port)
-                                                    }
-                                                }
-                                                isPinging = false
-                                            }
+                                modifier =
+                                    Modifier.weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable(
+                                            enabled = isConnected && !isPinging,
+                                            role = Role.Button,
+                                        ) {
+                                            haptics.performHapticFeedback(
+                                                HapticFeedbackType.LongPress
+                                            )
+                                            homeModel.triggerPing()
                                         }
-                                    },
                             ) {
                                 Text(
-                                    "Latency",
+                                    stringResource(R.string.home_latency),
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                                 Spacer(Modifier.height(2.dp))
-                                val currentPing = if (isConnected) pingLatency else disconnectedPingLatency
+                                val currentPing = if (isConnected) pingLatency else null
                                 Text(
-                                    text = when {
-                                        isPinging -> "Pinging\u2026"
-                                        currentPing != null -> "$currentPing ms"
-                                        else -> "\u2014 ms"
-                                    },
-                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                    color = if (currentPing != null) statusColors.connected else MaterialTheme.colorScheme.onSurface,
+                                    text =
+                                        when {
+                                            isPinging -> stringResource(R.string.home_pinging)
+                                            currentPing != null -> "$currentPing ms"
+                                            else -> "\u2014 ms"
+                                        },
+                                    style =
+                                        MaterialTheme.typography.titleMedium.copy(
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                    color =
+                                        if (currentPing != null) statusColors.connected
+                                        else MaterialTheme.colorScheme.onSurface,
                                 )
                             }
                         }
@@ -492,36 +509,45 @@ fun HomeScreen(
                                 modifier = Modifier.weight(1f),
                             )
                             Spacer(Modifier.width(8.dp))
-                            val quotaText = when {
-                                isUnlimited -> "Unlimited"
-                                remaining != null && max != null -> "${formatBytes(remaining)} / ${formatBytes(max)}"
-                                remaining != null -> formatBytes(remaining)
-                                max != null -> "Limited to ${formatBytes(max)}"
-                                else -> "\u2014"
-                            }
+                            val quotaText =
+                                when {
+                                    remaining != null && max != null ->
+                                        "${formatBytes(remaining)} / ${formatBytes(max)}"
+                                    remaining != null -> formatBytes(remaining)
+                                    isUnlimited -> "Unlimited"
+                                    max != null -> "Limited to ${formatBytes(max)}"
+                                    else -> "\u2014"
+                                }
                             Text(
                                 quotaText,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                modifier = Modifier.weight(1f),
+                                textAlign = TextAlign.End,
+                                style =
+                                    MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.SemiBold
+                                    ),
                                 color = MaterialTheme.colorScheme.onSurface,
                             )
                         }
 
                         Spacer(Modifier.height(8.dp))
 
-                        val quotaFraction = when {
-                            isUnlimited -> 1f
-                            max != null && max > 0L && remaining != null ->
-                                (remaining.toFloat() / max.toFloat()).coerceIn(0f, 1f)
-                            else -> 0f
-                        }
+                        val quotaFraction =
+                            when {
+                                max != null && max > 0L && remaining != null ->
+                                    (remaining.toFloat() / max.toFloat()).coerceIn(0f, 1f)
+                                isUnlimited -> 1f
+                                remaining != null && remaining > 0L -> 1f
+                                else -> 0f
+                            }
 
                         LinearProgressIndicator(
                             progress = { quotaFraction },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(6.dp)
-                                .clip(RoundedCornerShape(3.dp)),
-                            color = if (isConnected) statusColors.connected else MaterialTheme.colorScheme.outlineVariant,
+                            modifier =
+                                Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                            color =
+                                if (isConnected) statusColors.connected
+                                else MaterialTheme.colorScheme.primary,
                             trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
                         )
                     }

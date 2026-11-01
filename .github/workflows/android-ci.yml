@@ -6,103 +6,127 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  LIBBOX_URL: https://github.com/Vauth/sing-box/releases/download/v1.15.0-foxy-masque.2/libbox.aar
+  LIBBOX_SHA256: f1b59f4fab207b4c19f8ea3d145bc4dd0e834a530081d0dc045f4b795d6eac0b
+
 jobs:
   build:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Fetch and verify pinned core
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/libs
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
+            --proto '=https' --proto-redir '=https' -o app/libs/libbox.aar "$LIBBOX_URL"
+          echo "$LIBBOX_SHA256  app/libs/libbox.aar" | sha256sum --check --strict
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          packages: "platform-tools"
-
-      - name: Install NDK
-        run: sdkmanager --install "ndk;26.1.10909125"
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew || true
-
-      - name: Generate Gradle wrapper (if missing)
-        run: gradle wrapper --gradle-version 8.10.2 || true
-
-      - name: Assemble debug APK
-        run: ./gradlew assembleDebug --no-daemon
-
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
+          gradle-version: 8.10.2
+      - name: Lint and assemble debug
+        run: gradle :app:lintDebug :app:assembleDebug --no-daemon --console=plain
+      - uses: actions/upload-artifact@v4
         with:
           name: foxyvpn-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: app/build/reports/lint-results-*
+          if-no-files-found: ignore
 
   release:
-    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
+      - name: Configure keystore environment
+        run: echo "SIGNING_KEYSTORE_PATH=${{ runner.temp }}/foxyvpn-release.jks" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Fetch and verify pinned core
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/libs
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
+            --proto '=https' --proto-redir '=https' -o app/libs/libbox.aar "$LIBBOX_URL"
+          echo "$LIBBOX_SHA256  app/libs/libbox.aar" | sha256sum --check --strict
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          packages: "platform-tools"
-
-      - name: Install NDK
-        run: sdkmanager --install "ndk;26.1.10909125"
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew || true
-
-      - name: Generate Gradle wrapper (if missing)
-        run: gradle wrapper --gradle-version 8.10.2 || true
-
-      - name: Decode signing keystore
-        id: signing
+          gradle-version: 8.10.2
+      - name: Require release signing credentials
         env:
           SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+        shell: bash
         run: |
-          if [ -n "$SIGNING_KEYSTORE_BASE64" ]; then
-            printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 -d > release-keystore.jks
-            echo "signed=true" >> "$GITHUB_OUTPUT"
-            echo "Signing keystore decoded; the release APK will be signed."
-          else
-            echo "signed=false" >> "$GITHUB_OUTPUT"
-            echo "No SIGNING_KEYSTORE_BASE64 secret; the release APK will be unsigned."
-          fi
-
-      - name: Assemble release APK
+          set -euo pipefail
+          : "${SIGNING_KEYSTORE_BASE64:?Missing keystore secret}"
+          : "${SIGNING_KEY_ALIAS:?Missing key alias}"
+          : "${SIGNING_KEY_PASSWORD:?Missing key password}"
+          : "${SIGNING_STORE_PASSWORD:?Missing store password}"
+          umask 077
+          printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 --decode > "$SIGNING_KEYSTORE_PATH"
+      - name: Assemble signed release
         env:
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-        run: ./gradlew assembleRelease --no-daemon
-
-      - name: Remove the decoded keystore
+        run: gradle :app:assembleRelease --no-daemon --console=plain
+      - name: Verify APK signatures and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
+          for apk in app/build/outputs/apk/release/*.apk; do
+            "$APKSIGNER" verify --verbose "$apk"
+          done
+          cd app/build/outputs/apk/release
+          sha256sum *.apk > SHA256SUMS
+      - name: Remove keystore
         if: always()
-        run: rm -f release-keystore.jks
-
-      - name: Create GitHub Release
+        run: rm -f "$SIGNING_KEYSTORE_PATH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-mapping
+          path: app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: error
+      - name: Publish signed APKs
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/*.apk
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS
+          fail_on_unmatched_files: true
           generate_release_notes: true

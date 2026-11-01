@@ -30,9 +30,7 @@ object CrashReporter {
         runCatching { file.delete() }
         if (text.isNullOrBlank()) return
         AppLogger.e(TAG, "app crashed last run; captured stack trace follows")
-        text.lineSequence().forEach { line ->
-            if (line.isNotBlank()) AppLogger.e(TAG, line)
-        }
+        text.lineSequence().forEach { line -> if (line.isNotBlank()) AppLogger.e(TAG, line) }
     }
 
     private fun writeCrashFile(context: Context, thread: Thread, throwable: Throwable) {
@@ -41,7 +39,7 @@ object CrashReporter {
             pw.println("Thread: ${thread.name}")
             throwable.printStackTrace(pw)
         }
-        crashFile(context).writeText(writer.toString())
+        crashFile(context).writeText(AppLogger.redact(writer.toString()).take(128 * 1024))
     }
 
     private fun crashFile(context: Context): File = File(context.filesDir, CRASH_FILE_NAME)

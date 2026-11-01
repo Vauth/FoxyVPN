@@ -3,8 +3,6 @@ package com.vauth.foxyvpn.ui.theme
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 
-val FoxSeed = Color(0xFFFF7139)
-
 val md_theme_light_primary = Color(0xFFA03A00)
 val md_theme_light_onPrimary = Color(0xFFFFFFFF)
 val md_theme_light_primaryContainer = Color(0xFFFFDBCB)
@@ -91,22 +89,12 @@ val md_theme_dark_inverseSurface = Color(0xFFF1DED8)
 val md_theme_dark_inverseOnSurface = Color(0xFF382E2A)
 val md_theme_dark_scrim = Color(0xFF000000)
 
-data class FoxyStatusColors(
-    val connected: Color,
-    val connecting: Color,
-    val disconnected: Color,
-)
+data class FoxyStatusColors(val connected: Color, val connecting: Color)
 
-val LightStatusColors = FoxyStatusColors(
-    connected = Color(0xFF1B6E2F),
-    connecting = Color(0xFF8A5A00),
-    disconnected = md_theme_light_onSurfaceVariant,
-)
+val LightStatusColors =
+    FoxyStatusColors(connected = Color(0xFF1B6E2F), connecting = Color(0xFF8A5A00))
 
-val DarkStatusColors = FoxyStatusColors(
-    connected = Color(0xFF7BDF92),
-    connecting = Color(0xFFFFC46B),
-    disconnected = md_theme_dark_onSurfaceVariant,
-)
+val DarkStatusColors =
+    FoxyStatusColors(connected = Color(0xFF7BDF92), connecting = Color(0xFFFFC46B))
 
 val LocalFoxyStatusColors = staticCompositionLocalOf { LightStatusColors }

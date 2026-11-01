@@ -7,22 +7,25 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
-import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
+import com.vauth.foxyvpn.BuildConfig
 import com.vauth.foxyvpn.FoxyVpnApp
 import com.vauth.foxyvpn.MainActivity
 import com.vauth.foxyvpn.data.AppLogger
 import com.vauth.foxyvpn.data.ControlPlaneHttp
-import com.vauth.foxyvpn.data.FxaAuthRepository
+import com.vauth.foxyvpn.data.FxaRefreshFailure
 import com.vauth.foxyvpn.data.GUARDIAN_ENDPOINT_DEFAULT
 import com.vauth.foxyvpn.data.GuardianClient
+import com.vauth.foxyvpn.data.GuardianHttpError
 import com.vauth.foxyvpn.data.ProxyPass
 import com.vauth.foxyvpn.data.ProxyStateStore
 import com.vauth.foxyvpn.data.QuotaExceededError
@@ -30,28 +33,31 @@ import com.vauth.foxyvpn.data.RECOMMENDED_COUNTRY_CODE
 import com.vauth.foxyvpn.data.ServerListClient
 import com.vauth.foxyvpn.data.SettingsStore
 import com.vauth.foxyvpn.data.TokenInvalidError
-import com.vauth.foxyvpn.data.TokenStore
+import com.vauth.foxyvpn.data.TunnelSettings
+import com.vauth.foxyvpn.data.awaitResponse
 import com.vauth.foxyvpn.data.formatBytesPerSecond
 import com.vauth.foxyvpn.data.model.ConnectionState
 import com.vauth.foxyvpn.data.model.ProxyCandidate
-import com.vauth.foxyvpn.data.model.RuntimeAuth
-import com.vauth.foxyvpn.vpn.socks.LocalHttpProxyServer
-import com.vauth.foxyvpn.vpn.socks.LocalSocks5Server
-import com.vauth.foxyvpn.vpn.tun.HevSocks5Tunnel
-import com.vauth.foxyvpn.vpn.tun.HevSocks5TunnelConfig
-import com.vauth.foxyvpn.vpn.upstream.EdgeAddressResolver
-import com.vauth.foxyvpn.vpn.upstream.H2UpstreamSession
-import com.vauth.foxyvpn.vpn.upstream.UpstreamProxyConfig
-import com.vauth.foxyvpn.vpn.upstream.UpstreamSession
+import com.vauth.foxyvpn.data.retryDeadlineMillis
+import com.vauth.foxyvpn.data.retryDelayMillis
+import com.vauth.foxyvpn.data.tunnelSnapshot
 import com.vauth.foxyvpn.widget.QuickConnectWidgetProvider
+import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.Libbox
+import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.SetupOptions
+import java.io.File
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
@@ -67,146 +73,122 @@ data class VpnLiveStats(
 )
 
 private const val TAG = "FoxyVpnService"
-private const val CONNECT_TIMEOUT_MS = 20_000L
 private const val SERVER_LIST_FETCH_TIMEOUT_MS = 15_000L
-
-private const val UPSTREAM_WATCHDOG_INTERVAL_MS = 2_000L
-
-private const val RECONNECT_FAILURES_BEFORE_WARNING = 5
-private const val RECONNECT_BACKOFF_BASE_MS = 3_000L
-private const val RECONNECT_BACKOFF_CAP_MS = 60_000L
-
-private const val RECONNECT_FAILURES_BEFORE_EDGE_ROTATION = 2
-
-private const val MAX_ALTERNATE_EDGES = 3
-
-private const val UNHEALTHY_REDIAL_COOLDOWN_MS = 30_000L
-
-private const val PROXY_PASS_RENEWAL_FRACTION = 0.5
-private const val PROXY_PASS_RENEWAL_SAFETY_MARGIN_MS = 30_000L
-
-private const val PROXY_PASS_RENEWAL_FLOOR_MS = 15_000L
-
-private const val PROXY_PASS_RENEWAL_CEILING_MS = 30 * 60_000L
-
-private const val PROXY_PASS_RENEWAL_FALLBACK_MS = 4 * 60_000L
-
-private const val PROXY_PASS_RENEWAL_RETRY_MS = 30_000L
-
-private const val POST_TUN_SETTLE_MS = 250L
-
-private const val INITIAL_DIAL_SETTLE_MS = 600L
-
-private const val INITIAL_DIAL_MAX_ATTEMPTS = MAX_ALTERNATE_EDGES + 1
-private const val INITIAL_DIAL_BACKOFF_BASE_MS = 2_000L
-private const val INITIAL_DIAL_BACKOFF_CAP_MS = 8_000L
-
-private const val SPEED_UPDATE_INTERVAL_MS = 2_000L
-
-private const val TUN_ADDRESS_IPV6 = "fd00:1:fd00:1:fd00:1:fd00:1"
-private const val TUN_PREFIX_LENGTH_IPV6 = 128
-
-private const val WAKE_LOCK_TAG = "com.vauth.foxyvpn:vpn"
+private const val PROXY_PASS_FETCH_BUDGET_MS = 60_000L
+private const val PROXY_PASS_RETRY_MS = 5_000L
+private const val WAKE_LOCK_TAG = "com.vauth.foxyvpn:vpn-cpu"
 private const val WIFI_LOCK_TAG = "com.vauth.foxyvpn:vpn-wifi"
 
-private fun fullJitterBackoffMs(attempt: Int, baseMs: Long, capMs: Long): Long {
-    val exponential = baseMs * (1L shl attempt.coerceIn(0, 10))
-    val upperBound = exponential.coerceAtMost(capMs)
-    return (upperBound.toDouble() * Math.random()).toLong().coerceAtLeast(baseMs / 4)
-}
-
-private fun proxyPassRenewalDelayMs(expiresAtEpochSeconds: Long?): Long {
-    if (expiresAtEpochSeconds == null) return PROXY_PASS_RENEWAL_FALLBACK_MS
-    val remainingMs = expiresAtEpochSeconds * 1_000L - System.currentTimeMillis()
-    if (remainingMs <= 0L) return PROXY_PASS_RENEWAL_FLOOR_MS
-    val atHalfLife = (remainingMs * PROXY_PASS_RENEWAL_FRACTION).toLong()
-    val beforeExpiry = remainingMs - PROXY_PASS_RENEWAL_SAFETY_MARGIN_MS
-    return minOf(atHalfLife, beforeExpiry)
-        .coerceAtMost(PROXY_PASS_RENEWAL_CEILING_MS)
-        .coerceAtLeast(PROXY_PASS_RENEWAL_FLOOR_MS)
-}
+private fun proxyPassDeadline(expiresAtEpochSeconds: Long?): Long =
+    credentialDeadlineMillis(
+        expiresAtEpochSeconds,
+        System.currentTimeMillis(),
+        SystemClock.elapsedRealtime(),
+    )
 
 class FoxyVpnService : VpnService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val sessionInvalidationListener: () -> Unit = {
+        requestDisconnect("account session was cleared")
+    }
+    private val opMutex = nativeMutex
 
-    private val opMutex = Mutex()
-
-    private var tunFd: ParcelFileDescriptor? = null
-    private var socksServer: LocalSocks5Server? = null
-    private var httpProxyServer: LocalHttpProxyServer? = null
-    private var upstreamSession: UpstreamSession? = null
+    @Volatile private var commandServer: CommandServer? = null
     private var connectJob: Job? = null
-    private var watchdogJob: Job? = null
-    private var speedJob: Job? = null
-
+    private var retryJob: Job? = null
+    private var trafficMonitor: NativeTrafficMonitor? = null
+    private var pingJob: Job? = null
+    private var exitCheckJob: Job? = null
+    private var healthJob: Job? = null
+    private var connectionSettings: TunnelSettings? = null
+    private var connectionCandidate: ProxyCandidate? = null
+    private var directoryRefreshAfterElapsedMs = 0L
+    private val pingMutex = Mutex()
+    @Volatile private var activeSocksPort: Int? = null
+    @Volatile private var activeProxyCredentials: Pair<String, String> = "" to ""
     private var tokenRenewalJob: Job? = null
+    private var credentialExpiryJob: Job? = null
+    private val installedCredentialDeadline = AtomicLong(0L)
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wakeLockRenewalJob: Job? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    @Volatile
+    internal var nativeProtectionRequired = true
+        private set
+
     @Volatile private var tunnelInterfaceActive = false
-
     @Volatile private var boundNetwork: Network? = null
-
     @Volatile private var reportedUnderlying: Network? = null
-
-    @Volatile private var lastUnhealthyRedialAt = 0L
-
     @Volatile private var statusLabel: String = "Connecting\u2026"
-
     @Volatile private var foregroundActive = false
-
     @Volatile private var lastNotificationText: String? = null
+    @Volatile private var lastNotificationSubText: String? = null
+    private val connectionGeneration = AtomicInteger()
+    @Volatile private var stopping = false
+    private var libboxReady = false
+    private var healthRecoveryInProgress = false
+    private var reconnectAttempt = 0
+    private val retryNotBeforeElapsedMs = AtomicLong(0L)
+    private var controllerSecret = UUID.randomUUID().toString()
+    @Volatile private var activePlatformInterface: FoxyPlatformInterface? = null
 
     private class SessionResources(
-        val tunFd: ParcelFileDescriptor?,
-        val socksServer: LocalSocks5Server?,
-        val httpProxyServer: LocalHttpProxyServer?,
-        val upstreamSession: UpstreamSession?,
+        val commandServer: CommandServer?,
+        val platformInterface: FoxyPlatformInterface?,
     ) {
-        val isEmpty: Boolean get() = tunFd == null && socksServer == null && httpProxyServer == null && upstreamSession == null
+        val isEmpty: Boolean
+            get() = commandServer == null && platformInterface == null
     }
 
-    @Volatile
-    private var connectionGeneration = 0
+    private val networkCallback =
+        object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                reportUnderlyingNetwork(network)
+            }
 
-    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) {
-            reportUnderlyingNetwork(network)
-        }
+            override fun onCapabilitiesChanged(
+                network: Network,
+                capabilities: NetworkCapabilities,
+            ) {
+                reportUnderlyingNetwork(network, capabilities)
+            }
 
-        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-            reportUnderlyingNetwork(network, capabilities)
-        }
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                reportUnderlyingNetwork(network)
+                if (boundNetwork == network) activePlatformInterface?.notifyDefaultInterface()
+            }
 
-        override fun onLost(network: Network) {
-            if (boundNetwork != network) return
-            boundNetwork = null
-            reportedUnderlying = null
+            override fun onLost(network: Network) {
+                if (boundNetwork != network) return
+                boundNetwork = null
+                reportedUnderlying = null
 
-            if (tunnelInterfaceActive) {
-                runCatching { setUnderlyingNetworks(null) }
+                if (tunnelInterfaceActive) runCatching { setUnderlyingNetworks(null) }
+                firstUsableNetwork()?.let { reportUnderlyingNetwork(it) }
+                activePlatformInterface?.notifyDefaultInterface()
             }
         }
-    }
 
     private fun reportUnderlyingNetwork(
         network: Network,
         capabilities: NetworkCapabilities? = null,
     ) {
-        val caps = capabilities
-            ?: getSystemService(ConnectivityManager::class.java)?.getNetworkCapabilities(network)
+        val caps =
+            capabilities
+                ?: getSystemService(ConnectivityManager::class.java)
+                    ?.getNetworkCapabilities(network)
+        if (caps == null || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
 
-        if (caps == null) return
-
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+        if (firstUsableNetwork() != network) return
 
         if (tunnelInterfaceActive && reportedUnderlying != network) {
             reportedUnderlying = network
             runCatching { setUnderlyingNetworks(arrayOf(network)) }
                 .onFailure {
-
                     reportedUnderlying = null
                     AppLogger.w(TAG, "failed to report the underlying network to the platform", it)
                 }
@@ -215,55 +197,47 @@ class FoxyVpnService : VpnService() {
         val previous = boundNetwork
         if (previous == network) return
 
-        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) && previous != null) return
         boundNetwork = network
         runCatching { ControlPlaneHttp.client.connectionPool.evictAll() }
-        if (previous == null) return
+        activePlatformInterface?.notifyDefaultInterface()
 
-        if (_state.value != ConnectionState.CONNECTED) return
-        val session = upstreamSession ?: return
-
-        AppLogger.i(
-            TAG,
-            "underlying network changed; closing the upstream session bound to the old one so it is redialed now " +
-                "(its socket would otherwise stay ESTABLISHED and look healthy for minutes)",
-        )
-        runCatching { session.close() }
+        if (!stopping && _state.value == ConnectionState.CONNECTING && connectJob == null) {
+            connectJob = scope.launch { opMutex.withLock { connect() } }
+        }
     }
 
-    private fun onUpstreamSessionUnhealthy() {
-        if (_state.value != ConnectionState.CONNECTED) return
-        val session = upstreamSession ?: return
-        val now = System.currentTimeMillis()
-        val sinceLast = now - lastUnhealthyRedialAt
-        if (lastUnhealthyRedialAt != 0L && sinceLast < UNHEALTHY_REDIAL_COOLDOWN_MS) {
-            AppLogger.d(
-                TAG,
-                "ignoring an unhealthy-session verdict ${sinceLast}ms after the last rebuild " +
-                    "(cooldown ${UNHEALTHY_REDIAL_COOLDOWN_MS}ms)",
-            )
-            return
-        }
-        lastUnhealthyRedialAt = now
-        AppLogger.w(
-            TAG,
-            "the local proxy reports the upstream session is failing as a whole rather than for one destination; " +
-                "closing it so the watchdog redials",
-        )
-        runCatching { session.close() }
+    private fun ensureLibboxSetup() {
+        if (libboxReady) return
+        val baseDir = filesDir
+        val workingDir = filesDir
+        val tempDir = cacheDir
+        val options =
+            SetupOptions().apply {
+                basePath = baseDir.absolutePath
+                workingPath = workingDir.absolutePath
+                tempPath = tempDir.absolutePath
+                logMaxLines = 5000
+                debug = BuildConfig.DEBUG
+            }
+        Libbox.setup(options)
+        libboxReady = true
     }
 
     override fun onCreate() {
         super.onCreate()
+        _state.value = ConnectionState.DISCONNECTED
+        (applicationContext as FoxyVpnApp).tokenStore.onSessionInvalidated =
+            sessionInvalidationListener
         runCatching {
-
-            val underlyingNetworks = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                .build()
-            getSystemService(ConnectivityManager::class.java)
-                ?.registerNetworkCallback(underlyingNetworks, networkCallback)
-        }.onFailure { AppLogger.w(TAG, "could not register a network callback; handovers will be slower to detect", it) }
+                val underlyingNetworks =
+                    NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                        .build()
+                getSystemService(ConnectivityManager::class.java)
+                    ?.registerNetworkCallback(underlyingNetworks, networkCallback)
+            }
+            .onFailure { AppLogger.w(TAG, "could not register network callback", it) }
 
         scope.launch {
             _state.collect { state ->
@@ -273,60 +247,103 @@ class FoxyVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        ControlPlaneHttp.socketProtector = null
-        runCatching {
-            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(networkCallback)
+        stopping = true
+        synchronized(credentialCommitLock) {
+            connectionGeneration.incrementAndGet()
+            if (coreOwner === this) Libbox.setBearerToken("")
         }
         connectJob?.cancel()
-        connectJob = null
-        watchdogJob?.cancel()
-        watchdogJob = null
-        connectionGeneration++
-        releaseResources(detachResources(), stopNativeTunnel = true)
+        retryJob?.cancel()
+        tokenRenewalJob?.cancel()
+        runCatching {
+            getSystemService(ConnectivityManager::class.java)
+                ?.unregisterNetworkCallback(networkCallback)
+        }
+
+        stopMonitoring()
         releaseWakeLocks()
-        foregroundActive = false
-        lastNotificationText = null
-        boundNetwork = null
-        reportedUnderlying = null
-        scope.cancel()
-        _state.value = ConnectionState.DISCONNECTED
-        QuickConnectWidgetProvider.updateAll(this, ConnectionState.DISCONNECTED)
+        val server = commandServer
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                interruptNativeStart(server)
+                opMutex.withLock { teardown() }
+            } finally {
+                scope.cancel()
+            }
+        }
+        (applicationContext as FoxyVpnApp)
+            .tokenStore
+            .clearSessionInvalidationListener(sessionInvalidationListener)
         super.onDestroy()
     }
 
+    @Synchronized
     private fun acquireWakeLocks() {
+        if (stopping) return
+        if (wakeLock == null) {
+            runCatching {
+                    val power =
+                        applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                            ?: error("PowerManager unavailable")
+                    wakeLock =
+                        power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG).apply {
+                            setReferenceCounted(false)
+                            acquire(300_000L)
+                        }
+                }
+                .onFailure { AppLogger.d(TAG, "CPU wake lock unavailable: ${it.message}") }
+        }
+        if (wakeLock != null && wakeLockRenewalJob?.isActive != true) {
+            wakeLockRenewalJob =
+                scope.launch {
+                    while (isActive) {
+                        delay(180_000L)
+                        synchronized(this@FoxyVpnService) {
+                            if (!stopping)
+                                runCatching { wakeLock?.acquire(300_000L) }
+                                    .onFailure { AppLogger.w(TAG, "CPU wake lock renewal failed") }
+                        }
+                    }
+                }
+        }
         if (wifiLock == null) {
             runCatching {
-                val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-                    ?: error("WifiManager unavailable")
-                @Suppress("DEPRECATION")
-                wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG).apply {
-                    setReferenceCounted(false)
-                    acquire()
+                    val wifi =
+                        applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                            ?: error("WifiManager unavailable")
+                    @Suppress("DEPRECATION")
+                    wifiLock =
+                        wifi
+                            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, WIFI_LOCK_TAG)
+                            .apply {
+                                setReferenceCounted(false)
+                                acquire()
+                            }
                 }
-            }.onFailure { AppLogger.d(TAG, "Wi-Fi high-performance lock unavailable: ${it.message}") }
+                .onFailure { AppLogger.d(TAG, "Wi-Fi lock unavailable: ${it.message}") }
         }
     }
 
+    @Synchronized
     private fun releaseWakeLocks() {
+        wakeLockRenewalJob?.cancel()
+        wakeLockRenewalJob = null
+        runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
+            .onFailure { AppLogger.d(TAG, "error releasing CPU wake lock: ${it.message}") }
+        wakeLock = null
         runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
-            .onFailure { AppLogger.d(TAG, "error releasing the Wi-Fi lock: ${it.message}") }
+            .onFailure { AppLogger.d(TAG, "error releasing Wi-Fi lock: ${it.message}") }
         wifiLock = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-
         val action = intent?.action ?: ACTION_CONNECT
         if (action == ACTION_CONNECT || action == VpnService.SERVICE_INTERFACE) {
-
+            if (stopping) return START_NOT_STICKY
             if (_state.value != ConnectionState.DISCONNECTED) {
                 AppLogger.d(TAG, "ignoring duplicate connect request while ${_state.value}")
-
                 enterForeground(statusLabel)
                 return START_STICKY
-            }
-            if (intent == null) {
-                AppLogger.i(TAG, "the service was restarted by the system; bringing the tunnel back up")
             }
             _state.value = ConnectionState.CONNECTING
             _lastError.value = null
@@ -335,7 +352,6 @@ class FoxyVpnService : VpnService() {
 
             acquireWakeLocks()
             connectJob = scope.launch { opMutex.withLock { connect() } }
-
             return START_STICKY
         } else if (action == ACTION_DISCONNECT) {
             requestDisconnect("requested by the user")
@@ -343,826 +359,668 @@ class FoxyVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
-    private fun requestDisconnect(reason: String) {
-        val idle = _state.value == ConnectionState.DISCONNECTED &&
-            connectJob == null &&
-            watchdogJob == null
-        if (idle) {
-            releaseWakeLocks()
-            stopSelf()
-            return
-        }
-        AppLogger.i(TAG, "disconnect: $reason")
-
-        val endedGeneration = ++connectionGeneration
-        _state.value = ConnectionState.DISCONNECTED
-        _vpnLiveStats.value = VpnLiveStats()
-        _connectedAtEpochMs.value = null
-        _pingLatencyMs.value = null
-        _vpnEdgeIp.value = null
-        _connectedEndpoint.value = null
-        connectJob?.cancel()
-        connectJob = null
-        watchdogJob?.cancel()
-        watchdogJob = null
-        exitForeground()
-
-        releaseWakeLocks()
-
-        val doomed = detachResources()
-
-        scope.launch {
-            opMutex.withLock {
-
-                val stillOurs = connectionGeneration == endedGeneration
-                releaseResources(doomed, stopNativeTunnel = stillOurs)
-
-                if (stillOurs && _state.value == ConnectionState.DISCONNECTED) {
-                    stopSelf()
-                }
+    internal fun stopFromCore(platform: FoxyPlatformInterface) {
+        synchronized(credentialCommitLock) {
+            if (coreOwner === this && activePlatformInterface === platform && !stopping) {
+                requestDisconnect("requested by sing-box")
             }
         }
     }
 
+    private fun requestDisconnect(reason: String) {
+        synchronized(credentialCommitLock) {
+            if (stopping) return
+            stopping = true
+            connectionGeneration.incrementAndGet()
+            if (coreOwner === this) Libbox.setBearerToken("")
+        }
+        connectJob?.cancel()
+        retryJob?.cancel()
+        tokenRenewalJob?.cancel()
+        AppLogger.i(TAG, "disconnect: $reason")
+        statusLabel = "Disconnecting…"
+        stopMonitoring()
+        releaseWakeLocks()
+        val server = commandServer
+        scope.launch {
+            try {
+                interruptNativeStart(server)
+                opMutex.withLock { teardown() }
+            } finally {
+                exitForeground()
+                releaseWakeLocks()
+                stopSelf()
+            }
+        }
+    }
+
+    private fun interruptNativeStart(server: CommandServer?) {
+        runCatching { server?.closeService() }
+            .onFailure { AppLogger.w(TAG, "Could not interrupt the native session", it) }
+    }
+
+    private fun stopMonitoring() {
+        trafficMonitor?.stop()
+        trafficMonitor = null
+        pingJob?.cancel()
+        exitCheckJob?.cancel()
+        healthJob?.cancel()
+        credentialExpiryJob?.cancel()
+    }
+
     private fun ensureGenerationCurrent(myGeneration: Int) {
-        if (myGeneration != connectionGeneration) {
+        if (myGeneration != connectionGeneration.get()) {
             throw CancellationException("connect was superseded by a newer request")
         }
     }
 
-    private fun firstUsableNetwork(): Network? {
+    internal fun firstUsableNetwork(): Network? {
         val manager = getSystemService(ConnectivityManager::class.java) ?: return null
         @Suppress("DEPRECATION")
         val networks = runCatching { manager.allNetworks }.getOrDefault(emptyArray())
+        val ordered = (listOfNotNull(manager.activeNetwork, boundNetwork) + networks).distinct()
         var unvalidated: Network? = null
-        for (network in networks) {
+        for (network in ordered) {
             val capabilities = manager.getNetworkCapabilities(network) ?: continue
-
             if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
             if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
-            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return network
+            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+                return network
             if (unvalidated == null) unvalidated = network
         }
         return unvalidated
     }
 
-    private fun hasUsableNetwork(): Boolean {
-
-        getSystemService(ConnectivityManager::class.java) ?: return true
-        return firstUsableNetwork() != null
-    }
-
     private fun isFatalUpstreamError(error: Throwable): Boolean =
-        error is TokenInvalidError || error is QuotaExceededError
+        error is TokenInvalidError ||
+            error is QuotaExceededError ||
+            error is IllegalArgumentException ||
+            error is com.vauth.foxyvpn.data.SecureStorageException ||
+            (error is FxaRefreshFailure && error.permanent) ||
+            (error is GuardianHttpError && error.statusCode in listOf(401, 403))
 
     private fun startProxyPassRenewal(
-        myGeneration: Int,
-        initialExpiry: Long?,
+        generation: Int,
+        initialDeadline: Long,
+        sessionEpoch: Long,
         mintProxyPass: suspend () -> ProxyPass,
     ) {
         tokenRenewalJob?.cancel()
-        tokenRenewalJob = scope.launch {
-            var expiry = initialExpiry
-            AppLogger.i(
-                TAG,
-                "proxy pass renewal scheduled in ${proxyPassRenewalDelayMs(expiry) / 1_000}s " +
-                    (if (expiry == null) "(pass lifetime unknown; using a fixed interval)" else "(at half of its remaining life)"),
-            )
-            while (isActive) {
-                delay(proxyPassRenewalDelayMs(expiry))
-                if (myGeneration != connectionGeneration) return@launch
-
-                val session = upstreamSession
-                if (session == null || !session.isConnected) {
-                    AppLogger.d(TAG, "skipping proxy pass renewal: no live session (the watchdog's redial mints its own)")
-                    continue
-                }
-
-                val attempt = runCatching { mintProxyPass() }
-                val pass = attempt.getOrNull()
-                if (pass == null) {
-                    val error = attempt.exceptionOrNull()
-                    if (error is CancellationException) throw error
-                    if (error != null && isFatalUpstreamError(error)) {
-                        AppLogger.e(
-                            TAG,
-                            "proxy pass renewal failed for a reason retrying cannot fix; leaving the session to the watchdog",
-                            error,
-                        )
+        tokenRenewalJob =
+            scope.launch {
+                var deadline = initialDeadline
+                var nextDelay =
+                    (deadline - SystemClock.elapsedRealtime() - PROXY_PASS_FETCH_BUDGET_MS)
+                        .coerceAtLeast(0L)
+                while (isActive) {
+                    delay(nextDelay)
+                    if (generation != connectionGeneration.get() || stopping) return@launch
+                    val remaining = deadline - SystemClock.elapsedRealtime()
+                    if (remaining <= 0L) {
+                        _lastError.value =
+                            "Proxy credentials could not be renewed in time. Reconnect to retry."
+                        requestDisconnect("proxy pass renewal deadline reached")
                         return@launch
                     }
-                    AppLogger.w(TAG, "proxy pass renewal failed; retrying shortly: ${error?.message}")
-
-                    expiry = null
-                    delay(PROXY_PASS_RENEWAL_RETRY_MS)
-                    continue
+                    try {
+                        val pass =
+                            withTimeout(minOf(PROXY_PASS_FETCH_BUDGET_MS, remaining)) {
+                                mintProxyPass()
+                            }
+                        opMutex.withLock {
+                            val store = (applicationContext as FoxyVpnApp).tokenStore
+                            store.withCurrentSession(sessionEpoch) {
+                                synchronized(credentialCommitLock) {
+                                    ensureGenerationCurrent(generation)
+                                    validateProxyPass(pass)
+                                    Libbox.setBearerToken(pass.token)
+                                    installedCredentialDeadline.set(
+                                        proxyPassDeadline(pass.expiresAtEpochSeconds)
+                                    )
+                                }
+                            }
+                        }
+                        deadline = installedCredentialDeadline.get()
+                        nextDelay =
+                            (deadline - SystemClock.elapsedRealtime() - PROXY_PASS_FETCH_BUDGET_MS)
+                                .coerceAtLeast(0L)
+                        AppLogger.i(TAG, "proxy pass replaced through the scoped core API")
+                    } catch (error: Exception) {
+                        if (
+                            error is CancellationException && error !is TimeoutCancellationException
+                        )
+                            throw error
+                        if (isFatalUpstreamError(error)) {
+                            _lastError.value = friendlyErrorMessage(error)
+                            requestDisconnect("credential renewal was rejected")
+                            return@launch
+                        }
+                        AppLogger.w(
+                            TAG,
+                            "proxy pass renewal failed; retrying within its validity deadline",
+                            error,
+                        )
+                        nextDelay =
+                            minOf(
+                                maxOf(
+                                    PROXY_PASS_RETRY_MS,
+                                    (error as? GuardianHttpError)?.retryAfterMs ?: 0L,
+                                ),
+                                (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L),
+                            )
+                    }
                 }
-
-                if (myGeneration != connectionGeneration) return@launch
-
-                val live = upstreamSession
-                if (live == null || !live.isConnected) {
-
-                    AppLogger.d(
-                        TAG,
-                        "minted a fresh proxy pass but the session went down meanwhile; the watchdog's redial " +
-                            "will mint its own",
-                    )
-                    expiry = pass.expiresAtEpochSeconds
-                    continue
-                }
-
-                val lifetimeNote = pass.expiresAtEpochSeconds?.let { expiresAt ->
-                    val seconds = (expiresAt * 1_000L - System.currentTimeMillis()) / 1_000L
-                    " (valid for ${seconds}s)"
-                } ?: " (lifetime not stated)"
-                live.updateBearerToken(pass.token)
-                AppLogger.i(TAG, "proxy pass renewed in place$lifetimeNote; the tunnel was not rebuilt")
-
-                expiry = pass.expiresAtEpochSeconds
             }
+    }
+
+    private fun startCredentialExpiryWatchdog(generation: Int) {
+        credentialExpiryJob?.cancel()
+        credentialExpiryJob =
+            scope.launch {
+                while (isActive) {
+                    val remaining =
+                        installedCredentialDeadline.get() - SystemClock.elapsedRealtime()
+                    if (remaining > 0L) {
+                        delay(remaining)
+                        continue
+                    }
+                    synchronized(credentialCommitLock) {
+                        if (
+                            stopping ||
+                                coreOwner !== this@FoxyVpnService ||
+                                generation != connectionGeneration.get()
+                        )
+                            return@launch
+
+                        if (SystemClock.elapsedRealtime() >= installedCredentialDeadline.get()) {
+                            _lastError.value = "Proxy credentials expired. Reconnect to retry."
+                            requestDisconnect("installed credential deadline reached")
+                            return@launch
+                        }
+                    }
+                }
+            }
+    }
+
+    private fun validateProxyPass(pass: ProxyPass) {
+        require(
+            pass.token.isNotBlank() && !pass.token.contains('\r') && !pass.token.contains('\n')
+        ) {
+            "Guardian returned an invalid proxy credential"
+        }
+        val expiry = pass.expiresAtEpochSeconds
+        require(expiry == null || expiry - System.currentTimeMillis() / 1_000L > 60L) {
+            "Guardian returned a proxy credential with insufficient lifetime"
         }
     }
 
     private suspend fun connect() {
+        if (_state.value == ConnectionState.CONNECTED) {
+            AppLogger.d(TAG, "connect: already connected, skipping duplicate connect request")
+            return
+        }
+        if (stopping) throw CancellationException("Service is stopping")
 
-        val myGeneration = ++connectionGeneration
-
-        lastUnhealthyRedialAt = 0L
-
+        val retryWait =
+            (retryNotBeforeElapsedMs.get() - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        if (retryWait > 0) {
+            connectJob = null
+            scheduleReconnect(retryWait)
+            return
+        }
+        if (stopping) throw CancellationException("Service is stopping")
+        val previousOwner = coreOwner
+        if (previousOwner != null && previousOwner !== this) previousOwner.teardown()
+        synchronized(credentialCommitLock) { coreOwner = this }
+        val myGeneration = connectionGeneration.incrementAndGet()
         boundNetwork = null
 
-        EdgeAddressResolver.invalidate()
         runCatching {
-            AppLogger.i(TAG, "connect: starting")
-            val tokenStore = TokenStore(applicationContext)
-            if (tokenStore.loadAuth() == null) error("Not signed in")
-            val proxyStateStore = ProxyStateStore(applicationContext)
-            val settingsStore = SettingsStore(applicationContext)
-
-            val primaryCandidate = resolveConnectCandidate(proxyStateStore)
-            ensureGenerationCurrent(myGeneration)
-
-            var candidates = listOf(primaryCandidate)
-            var candidateIndex = 0
-            var alternatesDiscovered = false
-
-            fun activeCandidate(): ProxyCandidate = candidates[candidateIndex.coerceIn(0, candidates.lastIndex)]
-
-            suspend fun rotateCandidate(): Boolean {
-                if (candidateIndex + 1 >= candidates.size && !alternatesDiscovered) {
-                    alternatesDiscovered = true
-                    val fresh = discoverAlternateCandidates(primaryCandidate)
-                        .filter { discovered -> candidates.none { known -> known.authority == discovered.authority } }
-                        .take(MAX_ALTERNATE_EDGES)
-                    if (fresh.isNotEmpty()) {
-                        candidates = candidates + fresh
-                        AppLogger.i(
-                            TAG,
-                            "found ${fresh.size} alternate edge(s) in ${primaryCandidate.countryCode} to fail over to",
+                AppLogger.i(TAG, "connect: starting sing-box engine")
+                val app = applicationContext as FoxyVpnApp
+                val tokenStore = app.tokenStore
+                val sessionEpoch = tokenStore.sessionEpoch
+                if (tokenStore.loadAuth() == null) {
+                    tokenStore.storageError.value?.let {
+                        throw com.vauth.foxyvpn.data.SecureStorageException(
+                            IllegalStateException(it)
                         )
                     }
+                    throw TokenInvalidError("Not signed in")
                 }
-                if (candidateIndex + 1 >= candidates.size) return false
-                candidateIndex++
-                AppLogger.i(
-                    TAG,
-                    "failing over to edge ${activeCandidate().authority} " +
-                        "(${candidateIndex + 1} of ${candidates.size})",
+                val proxyStateStore = app.proxyStateStore
+                val settingsStore = app.settingsStore
+                val tunnelSettings =
+                    connectionSettings
+                        ?: settingsStore.tunnelSnapshot().also { connectionSettings = it }
+                controllerSecret = UUID.randomUUID().toString()
+
+                val directoryClient = app.serverListClient
+                val existingCandidate = connectionCandidate
+                val refreshRetry =
+                    existingCandidate != null &&
+                        reconnectAttempt > 0 &&
+                        SystemClock.elapsedRealtime() >= directoryRefreshAfterElapsedMs &&
+                        !directoryClient.hasFreshCache()
+                val primaryCandidate =
+                    if (existingCandidate == null || refreshRetry) {
+                        directoryRefreshAfterElapsedMs = SystemClock.elapsedRealtime() + 60_000L
+                        resolveConnectCandidate(proxyStateStore, existingCandidate).also {
+                            connectionCandidate = it
+                        }
+                    } else existingCandidate
+                ensureGenerationCurrent(myGeneration)
+
+                val socksPort = tunnelSettings.socksPort
+                ListenerAvailability.requireAvailable(
+                    listOf(socksPort, SettingsStore.CONTROLLER_PORT)
                 )
-                return true
-            }
+                val socksBindAddress = tunnelSettings.socksBindAddress
 
-            val upstreamProxyConfig = if (settingsStore.upstreamProxyEnabled && settingsStore.upstreamProxyHost.isNotBlank()) {
-                UpstreamProxyConfig(
-                    type = when (settingsStore.upstreamProxyType) {
-                        SettingsStore.UpstreamProxyType.SOCKS5 -> UpstreamProxyConfig.Type.SOCKS5
-                        SettingsStore.UpstreamProxyType.HTTP -> UpstreamProxyConfig.Type.HTTP
-                    },
-                    host = settingsStore.upstreamProxyHost,
-                    port = settingsStore.upstreamProxyPort,
-                    username = settingsStore.upstreamProxyUsername.ifBlank { null },
-                    password = settingsStore.upstreamProxyPassword.ifBlank { null },
-                )
-            } else {
-                null
-            }
-            val chainSuffix = if (upstreamProxyConfig != null) {
-                " via ${upstreamProxyConfig.type} proxy ${upstreamProxyConfig.host}:${upstreamProxyConfig.port}"
-            } else {
-                ""
-            }
-
-            val customEdgeAddress = settingsStore.effectiveCustomEdgeAddress
-            val edgeSuffix = if (customEdgeAddress != null) {
-                " via pinned edge $customEdgeAddress:${primaryCandidate.port}"
-            } else {
-                ""
-            }
-
-            val dohEndpointAddresses = settingsStore.effectiveBootstrapAddresses
-            val bootstrapDesc = if (dohEndpointAddresses.isEmpty()) {
-                "system DNS"
-            } else {
-                "${settingsStore.bootstrapDnsProvider.label} (${dohEndpointAddresses.joinToString(", ")})"
-            }
-
-            AppLogger.i(
-                TAG,
-                "connect: target=${primaryCandidate.authority} country=${primaryCandidate.countryCode} bootstrap=$bootstrapDesc$chainSuffix$edgeSuffix",
-            )
-
-            val socksPort = settingsStore.socksPort
-            val socksBindAddress = settingsStore.socksBindAddress
-            val httpProxyPort = settingsStore.httpProxyPort
-            val httpProxyEnabled = settingsStore.httpProxyEnabled
-            val proxyOnlyMode = settingsStore.proxyOnlyMode
-            val excludedApps = settingsStore.excludedApps
-
-            val dohUrl = settingsStore.effectiveDohUrl
-
-            fun connectedLabel(): String = if (proxyOnlyMode) {
-                if (httpProxyEnabled) {
-                    "Proxy active \u2022 SOCKS $socksPort, HTTP $httpProxyPort"
-                } else {
-                    "Proxy active \u2022 $socksBindAddress:$socksPort"
+                val proxyOnlyMode = tunnelSettings.proxyOnlyMode
+                nativeProtectionRequired = !proxyOnlyMode
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && isAlwaysOn && proxyOnlyMode) {
+                    throw IllegalArgumentException(
+                        "Proxy-only mode cannot satisfy Android always-on VPN"
+                    )
                 }
-            } else {
-                val target = activeCandidate()
-                "Connected \u2022 ${target.countryName.ifBlank { target.countryCode }}"
-            }
+                _proxyOnlyActive.value = proxyOnlyMode
 
-            if (proxyOnlyMode) {
-                ControlPlaneHttp.socketProtector = null
-            } else {
-                ControlPlaneHttp.socketProtector = { socket -> protect(socket) }
-            }
-
-            val mapdnsActive = !proxyOnlyMode && dohUrl == null
-            val socks = LocalSocks5Server(
-                socksBindAddress,
-                socksPort,
-                mapdnsActive,
-                dohUrl,
-                { upstreamSession },
-            ) {
-                onUpstreamSessionUnhealthy()
-            }
-            socks.start()
-            socksServer = socks
-
-            if (httpProxyEnabled) {
-                val http = LocalHttpProxyServer(
-                    socksBindAddress,
-                    httpProxyPort,
-                    { upstreamSession },
-                ) {
-                    onUpstreamSessionUnhealthy()
-                }
-                http.start()
-                httpProxyServer = http
-            }
-            ensureGenerationCurrent(myGeneration)
-
-            if (proxyOnlyMode) {
-
-                tunnelInterfaceActive = false
-                AppLogger.i(
-                    TAG,
-                    "connect: proxy-only mode enabled, skipping TUN interface and tun2socks; " +
-                        "local proxy at $socksBindAddress:$socksPort",
-                )
-            } else {
-                val fd = establishTun(excludedApps, dohUrl, mtu = settingsStore.mtu) ?: error("Failed to establish TUN interface")
-                tunFd = fd
-                tunnelInterfaceActive = true
-
-                reportedUnderlying = null
-                runCatching {
-
-                    firstUsableNetwork()?.let { underlying -> reportUnderlyingNetwork(underlying) }
-                }
-
-                val tunnelConfigPath = HevSocks5TunnelConfig.write(
-                    applicationContext,
-                    socksPort,
-                    useMapDns = mapdnsActive,
-                    mtu = settingsStore.mtu,
-                )
-                val tunnelStarted = HevSocks5Tunnel.start(tunnelConfigPath, fd.fd)
-                if (!tunnelStarted) error("Failed to start the tun2socks tunnel (hev-socks5-tunnel)")
-                AppLogger.i(TAG, "connect: TUN interface up, hev-socks5-tunnel started")
-                delay(POST_TUN_SETTLE_MS)
-            }
-            ensureGenerationCurrent(myGeneration)
-
-            suspend fun mintProxyPass(): ProxyPass {
-                var auth = tokenStore.loadAuth() ?: throw TokenInvalidError("Not signed in")
-
-                if (!tokenStore.hasValidAccessToken()) {
-                    val renewed = renewAccessToken(tokenStore)
-                    if (renewed != null) {
-                        auth = renewed
-                        AppLogger.i(TAG, "the account's access token had expired and was renewed")
+                fun connectedLabel(): String =
+                    if (proxyOnlyMode) {
+                        "Proxy active \u2022 $socksBindAddress:$socksPort"
                     } else {
-
-                        AppLogger.w(
-                            TAG,
-                            "the account's access token is past its expiry and could not be renewed automatically; " +
-                                "you may need to sign in again",
-                        )
+                        val name =
+                            if (primaryCandidate.countryCode.equals(RECOMMENDED_COUNTRY_CODE, ignoreCase = true) ||
+                                primaryCandidate.countryName.equals("Recomended", ignoreCase = true)
+                            ) {
+                                "Recommended"
+                            } else {
+                                primaryCandidate.countryName.ifBlank { primaryCandidate.countryCode }
+                            }
+                        "Connected \u2022 $name"
                     }
-                }
-                val guardian = GuardianClient()
 
-                val pass = try {
-                    guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                } catch (rejected: TokenInvalidError) {
-                    AppLogger.w(TAG, "Guardian rejected the OAuth access token; renewing it and retrying", rejected)
-                    val renewed = renewAccessToken(tokenStore)
-                    if (renewed != null) {
-                        auth = renewed
-                        AppLogger.i(TAG, "the account's OAuth token was renewed after the rejection")
+                if (proxyOnlyMode) {
+                    ControlPlaneHttp.socketProtector = null
+                } else {
+                    ControlPlaneHttp.socketProtector = { socket -> protect(socket) }
+                }
+
+                ControlPlaneHttp.networkProvider = { firstUsableNetwork() }
+
+                suspend fun mintProxyPass(): ProxyPass {
+                    var auth = app.authRepository.ensureFreshAccessToken()
+                    if (tokenStore.sessionEpoch != sessionEpoch)
+                        throw TokenInvalidError("Session changed")
+                    val guardian = GuardianClient()
+                    val pass =
                         try {
                             guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                        } catch (stillRejected: TokenInvalidError) {
-                            AppLogger.w(TAG, "still rejected; activating the Guardian entitlement and retrying", stillRejected)
-                            guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                            guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                        }
-                    } else {
-                        AppLogger.w(TAG, "token renewal failed; activating Guardian entitlement and retrying")
-                        guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                        guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
-                    }
-                }
-                if (pass.quotaRemaining != null) {
-                    settingsStore.cachedQuotaRemaining = pass.quotaRemaining
-                }
-                if (pass.quotaMax != null) {
-                    settingsStore.cachedQuotaMax = pass.quotaMax
-                }
-                return pass
-            }
-
-            var currentPassExpiry: Long? = null
-
-            suspend fun dialUpstream(): Pair<H2UpstreamSession, Long?> {
-                val target = activeCandidate()
-                val pass = mintProxyPass()
-                currentPassExpiry = pass.expiresAtEpochSeconds
-                val lifetimeNote = pass.expiresAtEpochSeconds?.let { expiresAt ->
-                    val seconds = (expiresAt * 1_000L - System.currentTimeMillis()) / 1_000L
-                    " (valid for ${seconds}s)"
-                } ?: " (lifetime not stated)"
-                AppLogger.i(TAG, "connect: acquired Guardian proxy pass$lifetimeNote")
-
-                val edgeAddress = customEdgeAddress
-                    ?: resolveEdgeAddress(target.host, upstreamProxyConfig, dohEndpointAddresses)
-
-                val session = H2UpstreamSession(
-                    target.host,
-                    target.port,
-                    pass.token,
-                    upstreamProxyConfig,
-                    edgeAddress,
-                    tlsSplitMode = settingsStore.tlsSplitMode,
-                )
-                try {
-                    session.connect()
-                } catch (failure: Throwable) {
-
-                    runCatching { session.close() }
-                    throw failure
-                }
-                AppLogger.i(TAG, "connect: upstream HTTP/2 tunnel established to ${target.authority}")
-                return session to pass.expiresAtEpochSeconds
-            }
-
-            var dialAttempt = 0
-            var lastDialFailure: Throwable? = null
-            while (true) {
-                dialAttempt++
-                ensureGenerationCurrent(myGeneration)
-                val target = activeCandidate()
-
-                val dialResult = try {
-                    withTimeout(CONNECT_TIMEOUT_MS) { dialUpstream() }
-                } catch (cancellation: CancellationException) {
-
-                    if (cancellation !is TimeoutCancellationException) throw cancellation
-                    lastDialFailure = cancellation
-                    AppLogger.w(TAG, "dial to ${target.authority} timed out (attempt $dialAttempt)")
-                    null
-                } catch (error: Throwable) {
-
-                    if (isFatalUpstreamError(error)) throw error
-                    lastDialFailure = error
-                    AppLogger.w(TAG, "dial to ${target.authority} failed (attempt $dialAttempt): ${error.message}")
-                    null
-                }
-
-                val session = dialResult?.first
-
-                if (session != null) {
-                    if (myGeneration != connectionGeneration) {
-
-                        runCatching { session.close() }
-                        ensureGenerationCurrent(myGeneration)
-                    }
-                    upstreamSession = session
-                    delay(INITIAL_DIAL_SETTLE_MS)
-                    if (upstreamSession?.isConnected == true) break
-                    AppLogger.w(
-                        TAG,
-                        "upstream tunnel to ${target.authority} died immediately after connecting " +
-                            "(attempt $dialAttempt/$INITIAL_DIAL_MAX_ATTEMPTS)",
-                    )
-                    runCatching { upstreamSession?.close() }
-                    upstreamSession = null
-
-                    lastDialFailure = null
-                }
-
-                if (dialAttempt >= INITIAL_DIAL_MAX_ATTEMPTS) {
-
-                    val (failures, cleared) = proxyStateStore.recordFailure()
-                    if (cleared) {
-                        AppLogger.w(
-                            TAG,
-                            "the saved location failed $failures connects in a row; clearing it so the next " +
-                                "connect auto-selects a location",
-                        )
-                    }
-                    val failure = lastDialFailure
-                    if (failure != null) {
-                        error(
-                            "Could not reach a VPN server after $dialAttempt attempts across " +
-                                "${candidates.size} server(s). Last error: ${friendlyErrorMessage(failure)}",
-                        )
-                    }
-                    error(
-                        "The VPN server closed the connection immediately, $dialAttempt times in a row. " +
-                            "Try again shortly or pick a different location.",
-                    )
-                }
-
-                rotateCandidate()
-                delay(fullJitterBackoffMs(dialAttempt - 1, INITIAL_DIAL_BACKOFF_BASE_MS, INITIAL_DIAL_BACKOFF_CAP_MS))
-            }
-
-            ensureGenerationCurrent(myGeneration)
-
-            val establishedCandidate = activeCandidate()
-
-            if (establishedCandidate.authority == primaryCandidate.authority) {
-                proxyStateStore.save(primaryCandidate)
-            }
-
-            val connectedText = connectedLabel()
-            _connectedAtEpochMs.value = System.currentTimeMillis()
-            _state.value = ConnectionState.CONNECTED
-            statusLabel = connectedText
-            updateNotification(connectedText)
-            AppLogger.i(TAG, "connect: CONNECTED via ${establishedCandidate.authority}")
-
-            _connectedEndpoint.value = establishedCandidate.host to establishedCandidate.port
-            scope.launch {
-                val ping = PingUtil.measureTcpLatencyMs(establishedCandidate.host, establishedCandidate.port)
-                if (myGeneration == connectionGeneration) {
-                    _pingLatencyMs.value = ping
-                }
-            }
-
-            startProxyPassRenewal(myGeneration, currentPassExpiry) { mintProxyPass() }
-
-            if (settingsStore.exitCheckEnabled) {
-                scope.launch {
-                    val exitCheck = ExitCheck()
-                    exitCheck.fetchProxiedIpInfo(socksPort)
-                        .onSuccess { info ->
-                            if (myGeneration == connectionGeneration) {
-                                _vpnEdgeIp.value = info
-                                AppLogger.i(TAG, "exit check: observed ip=${info.ip}, country=${info.countryCode}")
+                        } catch (quota: QuotaExceededError) {
+                            settingsStore.saveAccountQuota(
+                                false,
+                                quota.quotaRemaining,
+                                quota.quotaMax,
+                            )
+                            throw quota
+                        } catch (rejected: TokenInvalidError) {
+                            AppLogger.w(
+                                TAG,
+                                "Guardian rejected the OAuth access token; renewing it and retrying",
+                                rejected,
+                            )
+                            val renewed = app.authRepository.refreshAccessToken()
+                            if (tokenStore.sessionEpoch != sessionEpoch)
+                                throw TokenInvalidError("Session changed")
+                            if (renewed != null) {
+                                auth = renewed
+                                try {
+                                    guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                                } catch (stillRejected: TokenInvalidError) {
+                                    AppLogger.w(
+                                        TAG,
+                                        "still rejected; activating the Guardian entitlement and retrying",
+                                        stillRejected,
+                                    )
+                                    guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                                    guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                                }
+                            } else {
+                                AppLogger.w(TAG, "token renewal failed; activating Guardian entitlement and retrying")
+                                guardian.activateGuardian(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
+                                guardian.fetchProxyPass(GUARDIAN_ENDPOINT_DEFAULT, auth.accessToken)
                             }
                         }
-                        .onFailure { AppLogger.w(TAG, "exit check failed (non-fatal)", it) }
-                }
-            }
-
-            if (!proxyOnlyMode) {
-                startSpeedUpdates()
-            }
-
-            watchdogJob = scope.launch {
-                var consecutiveFailures = 0
-                var waitingForNetwork = false
-
-                suspend fun stopWithFatalError(message: String) {
-                    AppLogger.e(TAG, "unrecoverable upstream failure; disconnecting: $message")
-                    _lastError.value = message
-                    connectionGeneration++
-                    watchdogJob = null
-                    _state.value = ConnectionState.DISCONNECTED
-                    exitForeground()
-                    releaseWakeLocks()
-                    val doomed = detachResources()
-                    opMutex.withLock { releaseResources(doomed, stopNativeTunnel = true) }
-                    stopSelf()
+                    val hasQuota = pass.quotaRemaining != null || pass.quotaMax != null
+                    val isUnlimited = if (hasQuota) false else settingsStore.cachedIsUnlimited
+                    settingsStore.saveAccountQuota(
+                        isUnlimited,
+                        pass.quotaRemaining,
+                        pass.quotaMax,
+                    )
+                    return pass
                 }
 
-                while (isActive) {
-                    delay(UPSTREAM_WATCHDOG_INTERVAL_MS)
-                    val current = upstreamSession
-                    if (current != null && current.isConnected) {
-                        if (consecutiveFailures > 0 || waitingForNetwork) {
-                            AppLogger.i(TAG, "upstream tunnel is healthy again")
-                            _lastError.value = null
-                            statusLabel = connectedLabel()
-                            updateNotification(statusLabel)
+                val pass = mintProxyPass()
+                validateProxyPass(pass)
+                val lifetimeNote =
+                    pass.expiresAtEpochSeconds?.let { expiresAt ->
+                        val seconds = (expiresAt * 1_000L - System.currentTimeMillis()) / 1_000L
+                        " (valid for ${seconds}s)"
+                    } ?: " (lifetime not stated)"
+                AppLogger.i(TAG, "connect: acquired Guardian proxy pass$lifetimeNote")
+                val initialDeadline = proxyPassDeadline(pass.expiresAtEpochSeconds)
+                tokenStore.withCurrentSession(sessionEpoch) {
+                    synchronized(credentialCommitLock) {
+                        ensureGenerationCurrent(myGeneration)
+                        Libbox.setBearerToken(pass.token)
+                        installedCredentialDeadline.set(initialDeadline)
+                    }
+                }
+
+                startCredentialExpiryWatchdog(myGeneration)
+
+                val configContent =
+                    SingBoxConfigBuilder.build(
+                        primaryCandidate = primaryCandidate,
+                        settings = tunnelSettings,
+                        bearerToken = pass.token,
+                        appPackageName = packageName,
+                        controllerSecret = controllerSecret,
+                    )
+                ensureGenerationCurrent(myGeneration)
+                ensureLibboxSetup()
+                try {
+                    Libbox.checkConfig(configContent)
+                } catch (error: Exception) {
+                    throw IllegalArgumentException(
+                        "Invalid VPN configuration: ${error.message}",
+                        error,
+                    )
+                }
+                AppLogger.d(TAG, "sing-box config validated successfully")
+
+                ensureGenerationCurrent(myGeneration)
+                val platformInterface =
+                    FoxyPlatformInterface(
+                        this,
+                        includeOnly =
+                            tunnelSettings.splitTunnelMode == SettingsStore.SplitTunnelMode.INCLUDE,
+                    ) {
+                        tunnelInterfaceActive = true
+                        reportedUnderlying = null
+                        runCatching {
+                            firstUsableNetwork()?.let { underlying ->
+                                reportUnderlyingNetwork(underlying)
+                            }
                         }
-                        consecutiveFailures = 0
-                        waitingForNetwork = false
-                        continue
+                    }
+                activePlatformInterface = platformInterface
+
+                ensureLibboxSetup()
+                runCatching { File(filesDir, "command.sock").delete() }
+                runCatching { File(filesDir, "cache.db").delete() }
+                val server = CommandServer(platformInterface, platformInterface)
+                commandServer = server
+                server.start()
+                ensureGenerationCurrent(myGeneration)
+                server.startOrReloadService(configContent, OverrideOptions())
+
+                ensureGenerationCurrent(myGeneration)
+
+                val connectedText = connectedLabel()
+                tokenStore.withCurrentSession(sessionEpoch) {
+                    synchronized(credentialCommitLock) {
+                        ensureGenerationCurrent(myGeneration)
+                        validateProxyPass(pass)
+                        _connectedAtElapsedMs.value = SystemClock.elapsedRealtime()
+                        _lastError.value = null
+                        _activeCandidate.value = primaryCandidate
+                        _tunnelHealth.value = TunnelHealth.CHECKING
+                        _state.value = ConnectionState.CONNECTED
+                    }
+                }
+                reconnectAttempt = 0
+                healthRecoveryInProgress = false
+                retryNotBeforeElapsedMs.set(0L)
+                statusLabel = connectedText
+                updateNotification(connectedText)
+                AppLogger.i(
+                    TAG,
+                    "connect: CONNECTED via sing-box core to ${primaryCandidate.authority}",
+                )
+
+                val proxyCredentials =
+                    if (tunnelSettings.localProxyAuthEnabled)
+                        tunnelSettings.localProxyUsername to tunnelSettings.localProxyPassword
+                    else "" to ""
+                activeProxyCredentials = proxyCredentials
+                activeSocksPort = socksPort
+                pingJob = scope.launch { measureActiveLatency() }
+
+                startProxyPassRenewal(
+                    generation = myGeneration,
+                    initialDeadline = initialDeadline,
+                    sessionEpoch = sessionEpoch,
+                ) {
+                    mintProxyPass()
+                }
+
+                exitCheckJob =
+                    scope.launch {
+                        val exitCheck = ExitCheck()
+                        repeat(3) { attempt ->
+                            if (!isCurrentSession(myGeneration)) return@launch
+                            val result =
+                                exitCheck.fetchProxiedIpInfo(
+                                    socksPort,
+                                    proxyCredentials.first,
+                                    proxyCredentials.second,
+                                )
+                            val info = result.getOrNull()
+                            if (info != null) {
+                                synchronized(credentialCommitLock) {
+                                    if (
+                                        isActive &&
+                                            isCurrentSession(myGeneration) &&
+                                            _activeCandidate.value == primaryCandidate
+                                    ) {
+                                        _vpnEdgeIp.value = info
+                                        AppLogger.i(
+                                            TAG,
+                                            "exit check: observed ip=${info.ip}, country=${info.countryCode}",
+                                        )
+                                    }
+                                }
+                                return@launch
+                            }
+                            AppLogger.w(
+                                TAG,
+                                "exit check attempt ${attempt + 1} failed (non-fatal)",
+                                result.exceptionOrNull(),
+                            )
+                            if (attempt < 2) delay(2_000L * (attempt + 1))
+                        }
                     }
 
-                    if (!hasUsableNetwork()) {
-                        if (!waitingForNetwork) {
-                            AppLogger.i(TAG, "no usable network; holding the session and waiting for connectivity")
-                            waitingForNetwork = true
-                            statusLabel = "Waiting for network\u2026"
-                            updateNotification(statusLabel)
-                        }
-                        consecutiveFailures = 0
-                        continue
-                    }
-                    if (waitingForNetwork) {
-                        AppLogger.i(TAG, "network is back; redialing the upstream tunnel")
-                        waitingForNetwork = false
-                    }
+                startSpeedUpdates(myGeneration)
+                startHealthMonitor(myGeneration, tunnelSettings, primaryCandidate)
+            }
+            .onFailure { error ->
+                if (error is CancellationException) throw error
+                synchronized(credentialCommitLock) { Libbox.setBearerToken("") }
+                releaseResources(detachResources())
+                ensureGenerationCurrent(myGeneration)
+                AppLogger.e(TAG, "connect failed", error)
+                val failedAutomaticRecovery = healthRecoveryInProgress
+                healthRecoveryInProgress = false
+                _lastError.value =
+                    if (failedAutomaticRecovery) "Automatic recovery failed. Reconnect to retry."
+                    else friendlyErrorMessage(error)
 
-                    AppLogger.w(TAG, "upstream tunnel is down; attempting to reconnect")
-                    runCatching { current?.close() }
+                if (
+                    !failedAutomaticRecovery &&
+                        !isFatalUpstreamError(error) &&
+                        _state.value != ConnectionState.DISCONNECTED
+                ) {
+                    reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(6)
+                    val retryDelay =
+                        retryDelayMillis(
+                            minOf(60_000L, 1_000L shl reconnectAttempt),
+                            (error as? GuardianHttpError)?.retryAfterMs,
+                            kotlin.random.Random.nextLong(250L, 1_000L),
+                        )
+                    val nowElapsed = SystemClock.elapsedRealtime()
+                    retryNotBeforeElapsedMs.set(retryDeadlineMillis(nowElapsed, retryDelay))
+                    AppLogger.w(
+                        TAG,
+                        "transient connect failure; retrying in ${retryDelay / 1_000L}s",
+                    )
+                    _state.value = ConnectionState.CONNECTING
                     statusLabel = "Reconnecting\u2026"
                     updateNotification(statusLabel)
-
-                    val dialResult = try {
-                        withTimeout(CONNECT_TIMEOUT_MS) { dialUpstream() }
-                    } catch (cancellation: CancellationException) {
-                        if (cancellation !is TimeoutCancellationException) throw cancellation
-                        consecutiveFailures++
-                        AppLogger.w(TAG, "upstream reconnect attempt $consecutiveFailures timed out")
-                        null
-                    } catch (error: Throwable) {
-                        if (isFatalUpstreamError(error)) {
-                            stopWithFatalError(friendlyErrorMessage(error))
-                            return@launch
-                        }
-                        consecutiveFailures++
-                        AppLogger.w(TAG, "upstream reconnect attempt $consecutiveFailures failed: ${error.message}")
-                        null
-                    }
-                    val fresh = dialResult?.first
-
-                    if (fresh == null) {
-
-                        if (consecutiveFailures % RECONNECT_FAILURES_BEFORE_EDGE_ROTATION == 0) {
-                            rotateCandidate()
-                        }
-
-                        if (consecutiveFailures == RECONNECT_FAILURES_BEFORE_WARNING) {
-                            _lastError.value =
-                                "Still trying to reconnect to the VPN server. Tap Disconnect to stop."
-                            AppLogger.e(
-                                TAG,
-                                "$consecutiveFailures consecutive reconnect failures; continuing to retry with backoff " +
-                                    "(capped at ${RECONNECT_BACKOFF_CAP_MS / 1_000}s between attempts)",
-                            )
-                        }
-                        delay(fullJitterBackoffMs(consecutiveFailures - 1, RECONNECT_BACKOFF_BASE_MS, RECONNECT_BACKOFF_CAP_MS))
-                        continue
-                    }
-
-                    if (myGeneration != connectionGeneration) {
-
-                        AppLogger.i(TAG, "discarding stale reconnect from a torn-down session generation")
-                        runCatching { fresh.close() }
-                        return@launch
-                    }
-                    upstreamSession = fresh
-                    consecutiveFailures = 0
-                    _lastError.value = null
-
-                    statusLabel = connectedLabel()
-                    updateNotification(statusLabel)
-                    AppLogger.i(TAG, "upstream tunnel reconnected via ${activeCandidate().authority}")
-
-                    startProxyPassRenewal(myGeneration, currentPassExpiry) { mintProxyPass() }
+                    connectJob = null
+                    scheduleReconnect(retryDelay)
+                    return
                 }
+                requestDisconnect("connection failed")
             }
-        }.onFailure { failure ->
-
-            if (failure is CancellationException) {
-                AppLogger.i(TAG, "connect: aborted because the connection was cancelled")
-                releaseResources(detachResources(), stopNativeTunnel = true)
-                return@onFailure
-            }
-            val message = if (failure is TimeoutCancellationException) {
-                "Connection timed out. Check your network and try again."
-            } else {
-                friendlyErrorMessage(failure)
-            }
-            AppLogger.e(TAG, "connect failed", failure)
-            _lastError.value = message
-            teardown()
-            exitForeground()
-            releaseWakeLocks()
-            stopSelf()
-        }
         connectJob = null
     }
 
-    private suspend fun resolveConnectCandidate(proxyStateStore: ProxyStateStore): ProxyCandidate {
-        proxyStateStore.load()?.let { return it }
-        AppLogger.i(TAG, "connect: no server previously selected; auto-selecting recommended location")
-        val client = (applicationContext as? FoxyVpnApp)?.serverListClient ?: ServerListClient(applicationContext)
-        val countries = runCatching {
-            withTimeout(SERVER_LIST_FETCH_TIMEOUT_MS) { client.fetchCountries() }
-        }.getOrElse {
-            client.loadCachedCountries()
-        }
-        val recommended = ServerListClient.candidatesForCountry(countries, RECOMMENDED_COUNTRY_CODE).randomOrNull()
-        val chosen = recommended ?: countries.firstOrNull { it.code.isNotBlank() }?.let { country ->
-            ServerListClient.candidatesForCountry(countries, country.code).randomOrNull()
-        } ?: error("No server selected and no servers are available. Choose a location first.")
-        proxyStateStore.save(chosen)
-        AppLogger.i(TAG, "connect: auto-selected ${chosen.authority} country=${chosen.countryCode}")
+    private fun scheduleReconnect(delayMillis: Long) {
+        if (retryJob?.isActive == true || stopping) return
+        retryJob =
+            scope.launch {
+                try {
+                    delay(delayMillis)
+                    if (
+                        !stopping &&
+                            _state.value == ConnectionState.CONNECTING &&
+                            connectJob == null
+                    ) {
+                        connectJob = scope.launch { opMutex.withLock { connect() } }
+                    }
+                } finally {
+                    retryJob = null
+                }
+            }
+    }
+
+    private suspend fun resolveConnectCandidate(
+        proxyStateStore: ProxyStateStore,
+        current: ProxyCandidate? = null,
+    ): ProxyCandidate {
+        val saved = current ?: proxyStateStore.load()
+        val client =
+            (applicationContext as? FoxyVpnApp)?.serverListClient
+                ?: ServerListClient(applicationContext)
+        val cached = client.loadCachedCountries()
+        val countries =
+            if (cached.isNotEmpty() && client.hasFreshCache()) cached
+            else
+                runCatching {
+                        withTimeout(SERVER_LIST_FETCH_TIMEOUT_MS) { client.fetchCountries() }
+                    }
+                    .getOrElse {
+                        if (it is CancellationException && it !is TimeoutCancellationException)
+                            throw it
+                        AppLogger.w(
+                            TAG,
+                            "could not refresh server directory; using cached selection",
+                            it,
+                        )
+                        cached
+                    }
+
+        if (countries.isEmpty() && saved != null) return saved
+        val candidates =
+            countries.flatMap { ServerListClient.candidatesForCountry(countries, it.code) }
+        val chosen =
+            com.vauth.foxyvpn.data.preferredConnectionCandidates(candidates, saved).randomOrNull()
+                ?: throw IllegalArgumentException(
+                    if (saved == null) "No servers are available. Choose a location first."
+                    else "No available servers in the selected location. Choose another location."
+                )
+
+        if (current == null) proxyStateStore.saveIfUnchanged(saved, chosen)
         return chosen
     }
 
-    private suspend fun discoverAlternateCandidates(primary: ProxyCandidate): List<ProxyCandidate> {
-        val attempt = runCatching {
-            val client = (applicationContext as? FoxyVpnApp)?.serverListClient ?: ServerListClient(applicationContext)
-            val countries = runCatching {
-                withTimeout(SERVER_LIST_FETCH_TIMEOUT_MS) { client.fetchCountries() }
-            }.getOrElse {
-                client.loadCachedCountries()
-            }
-            val sameCity = ServerListClient.candidatesForCity(countries, primary.countryCode, primary.cityCode)
-            val sameCountry = ServerListClient.candidatesForCountry(countries, primary.countryCode)
-            (sameCity + sameCountry)
-                .distinctBy { it.authority }
-                .filter { it.authority != primary.authority }
+    private fun friendlyErrorMessage(error: Throwable): String =
+        when (error) {
+            is QuotaExceededError -> "Your VPN quota is exhausted. Try again later."
+            is TokenInvalidError -> "Your session was rejected. Please sign in again."
+            is GuardianHttpError ->
+                if (error.statusCode in listOf(401, 403)) {
+                    "Your session was rejected. Please sign in again."
+                } else error.message ?: "Guardian is temporarily unavailable"
+            is TimeoutCancellationException -> "the connection timed out"
+            else -> error.message ?: (error::class.simpleName ?: "Connection failed")
         }
-        val failure = attempt.exceptionOrNull()
-        if (failure is CancellationException && failure !is TimeoutCancellationException) throw failure
-        if (failure != null) {
-            AppLogger.w(TAG, "could not fetch alternate edges; staying with ${primary.authority}", failure)
-            return emptyList()
-        }
-        return attempt.getOrDefault(emptyList())
-    }
-
-    private suspend fun resolveEdgeAddress(
-        host: String,
-        upstreamProxy: UpstreamProxyConfig?,
-        dohEndpointAddresses: List<String>,
-    ): String? {
-        if (upstreamProxy != null) return null
-        if (dohEndpointAddresses.isEmpty()) {
-            AppLogger.d(TAG, "resolving $host via system DNS resolver (direct network)")
-            return null
-        }
-        return EdgeAddressResolver.resolve(host, dohEndpointAddresses)
-    }
-
-    private suspend fun renewAccessToken(tokenStore: TokenStore): RuntimeAuth? {
-        val attempt = runCatching { FxaAuthRepository(tokenStore).refreshAccessToken() }
-        val failure = attempt.exceptionOrNull()
-        if (failure is CancellationException) throw failure
-        if (failure != null) {
-            AppLogger.w(TAG, "renewing the account's access token failed", failure)
-            return null
-        }
-        return attempt.getOrNull()
-    }
-
-    private fun friendlyErrorMessage(error: Throwable): String = when (error) {
-        is QuotaExceededError -> "Your VPN quota is exhausted. Try again later."
-        is TokenInvalidError -> "Your session was rejected. Please sign in again."
-        is TimeoutCancellationException -> "the connection timed out"
-        else -> {
-            val untrusted = generateSequence(error) { it.cause }.take(8).any {
-                it is java.security.cert.CertPathValidatorException || it is java.security.cert.CertificateException
-            }
-            val base = error.message ?: (error::class.simpleName ?: "Connection failed")
-            if (untrusted) {
-                "$base (this device does not trust the VPN server's certificate; updating Android or the device's date/time may help)"
-            } else {
-                base
-            }
-        }
-    }
-
-    private fun establishTun(
-        excludedApps: Set<String>,
-        dohUrl: String?,
-        mtu: Int = HevSocks5TunnelConfig.TUN_MTU,
-    ): ParcelFileDescriptor? {
-        val dnsServer = HevSocks5TunnelConfig.MAPDNS_ADDRESS
-        if (dohUrl != null) {
-            AppLogger.i(TAG, "establishTun: dns=DoH ($dohUrl)")
-        } else {
-            AppLogger.i(TAG, "establishTun: dns=mapdns ($dnsServer)")
-        }
-        return Builder()
-            .setSession("FoxyVPN")
-            .addAddress(HevSocks5TunnelConfig.TUN_ADDRESS, 32)
-            .addRoute("0.0.0.0", 0)
-            .apply {
-
-                val ipv6Address = runCatching {
-                    addAddress(TUN_ADDRESS_IPV6, TUN_PREFIX_LENGTH_IPV6)
-                }.onFailure {
-                    AppLogger.w(
-                        TAG,
-                        "could not add an IPv6 address to the TUN interface; IPv6 will be captured by the " +
-                            "tunnel's default route and dropped rather than sent in the clear",
-                        it,
-                    )
-                }
-
-                runCatching { addRoute("::", 0) }.onFailure {
-                    AppLogger.e(
-                        TAG,
-                        "could not claim the IPv6 default route; IPv6 traffic may bypass the tunnel and leak " +
-                            "the device's real address",
-                        it,
-                    )
-                }
-                if (ipv6Address.isFailure) {
-                    AppLogger.i(TAG, "establishTun: IPv6 is routed into the tunnel and blackholed (no IPv6 address)")
-                }
-            }
-            .addDnsServer(dnsServer)
-
-            .setMtu(mtu)
-            .setBlocking(true)
-            .apply {
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    runCatching { setMetered(false) }
-                        .onFailure { AppLogger.d(TAG, "could not mark the tunnel as unmetered: ${it.message}") }
-                }
-            }
-            .apply {
-                runCatching { addDisallowedApplication(packageName) }
-                    .onFailure { AppLogger.w(TAG, "failed to exclude own app from the VPN tunnel", it) }
-                for (excludedPackage in excludedApps) {
-                    runCatching { addDisallowedApplication(excludedPackage) }
-                        .onFailure { AppLogger.w(TAG, "failed to exclude $excludedPackage from the VPN tunnel (app may be uninstalled)", it) }
-                }
-            }
-            .establish()
-    }
 
     private fun teardown() {
-        connectionGeneration++
-        watchdogJob?.cancel()
-        watchdogJob = null
-        releaseResources(detachResources(), stopNativeTunnel = true)
+        retryJob?.cancel()
+        retryJob = null
+        connectJob?.cancel()
+        connectJob = null
+        val ownsCore =
+            synchronized(credentialCommitLock) {
+                if (coreOwner === this) {
+                    Libbox.setBearerToken("")
+                    coreOwner = null
+                    true
+                } else false
+            }
+        releaseResources(detachResources())
+        if (!ownsCore) return
+        ControlPlaneHttp.socketProtector = null
+        ControlPlaneHttp.networkProvider = null
         _state.value = ConnectionState.DISCONNECTED
         _vpnLiveStats.value = VpnLiveStats()
-        _connectedAtEpochMs.value = null
+        _connectedAtElapsedMs.value = null
         _pingLatencyMs.value = null
         _vpnEdgeIp.value = null
-        _connectedEndpoint.value = null
+        _activeCandidate.value = null
+        _tunnelHealth.value = TunnelHealth.UNKNOWN
+        connectionSettings = null
+        connectionCandidate = null
+        healthRecoveryInProgress = false
+        QuickConnectWidgetProvider.updateAll(this, ConnectionState.DISCONNECTED)
     }
 
     private fun detachResources(): SessionResources {
-        speedJob?.cancel()
-        speedJob = null
+        credentialExpiryJob?.cancel()
+        credentialExpiryJob = null
+        activeSocksPort = null
+        activeProxyCredentials = "" to ""
+        pingJob?.cancel()
+        pingJob = null
+        exitCheckJob?.cancel()
+        exitCheckJob = null
+        healthJob?.cancel()
+        healthJob = null
+        trafficMonitor?.stop()
+        trafficMonitor = null
 
         tokenRenewalJob?.cancel()
         tokenRenewalJob = null
-        val detached = SessionResources(tunFd, socksServer, httpProxyServer, upstreamSession)
-        tunFd = null
+        val detached = SessionResources(commandServer, activePlatformInterface)
         tunnelInterfaceActive = false
-        socksServer = null
-        httpProxyServer = null
-        upstreamSession = null
+        commandServer = null
+        activePlatformInterface = null
         return detached
     }
 
-    private fun releaseResources(resources: SessionResources, stopNativeTunnel: Boolean) {
-        if (resources.isEmpty && !stopNativeTunnel) return
-        if (stopNativeTunnel) {
-            runCatching { HevSocks5Tunnel.stop() }.onFailure { AppLogger.w(TAG, "error stopping tun2socks tunnel", it) }
-        }
-        runCatching { resources.socksServer?.stop() }.onFailure { AppLogger.w(TAG, "error stopping local SOCKS5 server", it) }
-        runCatching { resources.httpProxyServer?.stop() }.onFailure { AppLogger.w(TAG, "error stopping local HTTP proxy server", it) }
-        runCatching { resources.upstreamSession?.close() }.onFailure { AppLogger.w(TAG, "error closing upstream session", it) }
-        runCatching { resources.tunFd?.close() }.onFailure { AppLogger.w(TAG, "error closing TUN interface", it) }
+    private fun releaseResources(resources: SessionResources) {
+        if (resources.isEmpty) return
+        runCatching { resources.commandServer?.closeService() }
+            .onFailure { AppLogger.w(TAG, "error closing sing-box service", it) }
+        runCatching { resources.commandServer?.close() }
+            .onFailure { AppLogger.w(TAG, "error closing sing-box command server", it) }
+        runCatching { resources.platformInterface?.closeTun() }
+            .onFailure { AppLogger.w(TAG, "error closing VPN interface", it) }
     }
 
     override fun onRevoke() {
@@ -1170,105 +1028,272 @@ class FoxyVpnService : VpnService() {
         super.onRevoke()
     }
 
-    private fun startSpeedUpdates() {
-        speedJob?.cancel()
-        speedJob = scope.launch {
-            var lastStats = HevSocks5Tunnel.stats()
-            var lastSampleAt = System.currentTimeMillis()
-            while (isActive) {
-                delay(SPEED_UPDATE_INTERVAL_MS)
-                val stats = HevSocks5Tunnel.stats()
-                val now = System.currentTimeMillis()
-                val elapsedSeconds = ((now - lastSampleAt).coerceAtLeast(1)).toDouble() / 1_000.0
+    private fun isCurrentSession(generation: Int): Boolean =
+        !stopping &&
+            coreOwner === this &&
+            generation == connectionGeneration.get() &&
+            _state.value == ConnectionState.CONNECTED
 
-                val txRate = ((stats[1] - lastStats[1]).coerceAtLeast(0) / elapsedSeconds).toLong()
-                val rxRate = ((stats[3] - lastStats[3]).coerceAtLeast(0) / elapsedSeconds).toLong()
-                val totalSessionBytes = (stats[1] + stats[3]).coerceAtLeast(0L)
-                lastStats = stats
-                lastSampleAt = now
-                if (_state.value != ConnectionState.CONNECTED) continue
-                _vpnLiveStats.value = VpnLiveStats(
-                    txRateBytesPerSec = txRate,
-                    rxRateBytesPerSec = rxRate,
-                    sessionBytes = totalSessionBytes,
-                )
-                updateNotification(
-                    statusLabel,
-                    "\u2193 ${formatBytesPerSecond(rxRate)}  \u2191 ${formatBytesPerSecond(txRate)}",
-                )
+    private suspend fun measureActiveLatency(): Int? {
+
+        val generation = connectionGeneration.get()
+        val port = activeSocksPort ?: return null
+        return pingMutex.withLock {
+            fun current() = isCurrentSession(generation) && activeSocksPort == port
+            if (!current()) return@withLock null
+            val url = (applicationContext as FoxyVpnApp).settingsStore.latencyProbeUrl
+            val credentials = activeProxyCredentials
+            val latency =
+                PingUtil.measureProxyLatencyMs(port, url, credentials.first, credentials.second)
+            synchronized(credentialCommitLock) {
+                if (current()) {
+                    _pingLatencyMs.value = latency
+                    latency
+                } else null
             }
         }
     }
 
+    private fun startHealthMonitor(
+        generation: Int,
+        settings: TunnelSettings,
+        candidate: ProxyCandidate,
+    ) {
+        healthJob?.cancel()
+        healthJob =
+            scope.launch {
+                var failures = 0
+                val credentials = activeProxyCredentials
+                val urls =
+                    listOf(
+                        "https://www.gstatic.com/generate_204",
+                        "https://www.cloudflare.com/cdn-cgi/trace",
+                    )
+                fun current() = isActive && isCurrentSession(generation)
+                while (current()) {
+                    val network = firstUsableNetwork()
+                    val capabilities =
+                        network?.let {
+                            getSystemService(ConnectivityManager::class.java)
+                                ?.getNetworkCapabilities(it)
+                        }
+                    if (
+                        capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) !=
+                            true
+                    ) {
+                        synchronized(credentialCommitLock) {
+                            if (current()) _tunnelHealth.value = TunnelHealth.NO_NETWORK
+                        }
+                        failures = 0
+                        delay(60_000L)
+                        continue
+                    }
+                    val healthy =
+                        urls.any {
+                            PingUtil.measureProxyLatencyMs(
+                                settings.socksPort,
+                                it,
+                                credentials.first,
+                                credentials.second,
+                            ) != null
+                        }
+                    synchronized(credentialCommitLock) {
+                        if (!current()) return@launch
+                        _tunnelHealth.value =
+                            if (healthy) TunnelHealth.HEALTHY else TunnelHealth.UNREACHABLE
+                    }
+                    failures = if (healthy) 0 else failures + 1
+                    if (
+                        failures >= 3 &&
+                            settings.automaticRecovery &&
+                            settings.effectiveCustomEdgeAddress == null
+                    ) {
+
+                        val directWorks =
+                            urls.all { url ->
+                                try {
+                                    val request = okhttp3.Request.Builder().url(url).build()
+                                    ControlPlaneHttp.client.newCall(request).awaitResponse().use {
+                                        it.isSuccessful
+                                    }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    false
+                                }
+                            }
+                        if (
+                            directWorks &&
+                                current() &&
+                                firstUsableNetwork() == network &&
+                                recoveryBudget.tryAcquire(SystemClock.elapsedRealtime())
+                        ) {
+                            val directory = (applicationContext as FoxyVpnApp).serverListClient
+                            val cached = directory.loadCachedCountries()
+                            val countries =
+                                if (cached.isNotEmpty() && directory.hasFreshCache()) cached
+                                else
+                                    try {
+                                        withTimeout(SERVER_LIST_FETCH_TIMEOUT_MS) {
+                                            directory.fetchCountries()
+                                        }
+                                    } catch (cancelled: CancellationException) {
+                                        if (cancelled !is TimeoutCancellationException)
+                                            throw cancelled
+                                        cached
+                                    } catch (_: Exception) {
+                                        cached
+                                    }
+                            if (!current() || firstUsableNetwork() != network) return@launch
+                            val alternate =
+                                ServerListClient.candidatesForCountry(
+                                        countries,
+                                        candidate.countryCode,
+                                    )
+                                    .filter { it.authority != candidate.authority }
+                                    .randomOrNull()
+                            AppLogger.w(
+                                TAG,
+                                "confirmed proxy-path failure; bounded recovery within the selected country",
+                            )
+
+                            connectJob =
+                                scope.launch {
+                                    opMutex.withLock {
+                                        synchronized(credentialCommitLock) {
+                                            if (
+                                                stopping ||
+                                                    generation != connectionGeneration.get() ||
+                                                    coreOwner !== this@FoxyVpnService
+                                            )
+                                                return@withLock
+                                            Libbox.setBearerToken("")
+                                            _state.value = ConnectionState.CONNECTING
+                                            _activeCandidate.value = null
+                                            _vpnEdgeIp.value = null
+                                            _pingLatencyMs.value = null
+                                            _vpnLiveStats.value = VpnLiveStats()
+                                            _connectedAtElapsedMs.value = null
+                                            _tunnelHealth.value = TunnelHealth.CHECKING
+                                        }
+                                        releaseResources(detachResources())
+                                        connectionCandidate = alternate ?: candidate
+                                        statusLabel = "Reconnecting…"
+                                        updateNotification(statusLabel)
+                                        healthRecoveryInProgress = true
+                                        connect()
+                                    }
+                                }
+                            return@launch
+                        }
+                    }
+                    delay(60_000L)
+                }
+            }
+    }
+
+    private fun startSpeedUpdates(generation: Int) {
+        trafficMonitor?.stop()
+        trafficMonitor =
+            NativeTrafficMonitor(scope) { stats ->
+                    synchronized(credentialCommitLock) {
+                        if (isCurrentSession(generation)) {
+                            _vpnLiveStats.value = stats
+                            updateNotification(
+                                statusLabel,
+                                "\u2193 ${formatBytesPerSecond(stats.rxRateBytesPerSec)}  \u2191 ${formatBytesPerSecond(stats.txRateBytesPerSec)}",
+                            )
+                        }
+                    }
+                }
+                .also { it.start() }
+    }
+
     private fun buildNotification(text: String, subText: String? = null): Notification {
-        val openIntent = PendingIntent.getActivity(
-            this, REQUEST_CODE_OPEN, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
+        val openIntent =
+            PendingIntent.getActivity(
+                this,
+                REQUEST_CODE_OPEN,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
 
-        val disconnectIntent = PendingIntent.getService(
-            this, REQUEST_CODE_DISCONNECT, Intent(this, FoxyVpnService::class.java).setAction(ACTION_DISCONNECT),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val builder = NotificationCompat.Builder(this, FoxyVpnApp.VPN_NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("FoxyVPN")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(openIntent)
-            .setOngoing(true)
+        val disconnectIntent =
+            PendingIntent.getService(
+                this,
+                REQUEST_CODE_DISCONNECT,
+                Intent(this, FoxyVpnService::class.java).setAction(ACTION_DISCONNECT),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+        val builder =
+            NotificationCompat.Builder(this, FoxyVpnApp.VPN_NOTIFICATION_CHANNEL_ID)
+                .setContentTitle("FoxyVPN")
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.ic_lock_lock)
+                .setContentIntent(openIntent)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "Disconnect",
+                    disconnectIntent,
+                )
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
 
-            .setOnlyAlertOnce(true)
-
-            .setShowWhen(false)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-
-            .setLocalOnly(true)
-
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", disconnectIntent)
         if (subText != null) {
-            builder.setStyle(NotificationCompat.BigTextStyle().bigText("$text\n$subText"))
+            builder.setSubText(subText)
         }
         return builder.build()
     }
 
     private fun enterForeground(text: String) {
-        foregroundActive = true
+        val notification = buildNotification(text)
         lastNotificationText = text
+        lastNotificationSubText = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
-                buildNotification(text),
+                notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
-            startForeground(NOTIFICATION_ID, buildNotification(text))
+            startForeground(NOTIFICATION_ID, notification)
         }
+        foregroundActive = true
     }
 
     private fun exitForeground() {
+        if (!foregroundActive) return
         foregroundActive = false
         lastNotificationText = null
-        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        lastNotificationSubText = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     private fun updateNotification(text: String, subText: String? = null) {
         if (!foregroundActive) return
-        val key = if (subText == null) text else "$text\n$subText"
-        if (key == lastNotificationText) return
-        lastNotificationText = key
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        runCatching { manager.notify(NOTIFICATION_ID, buildNotification(text, subText)) }
+        if (lastNotificationText == text && lastNotificationSubText == subText) return
+        lastNotificationText = text
+        lastNotificationSubText = subText
+        val notification = buildNotification(text, subText)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.notify(NOTIFICATION_ID, notification)
     }
 
     companion object {
+        private val recoveryBudget = RecoveryBudget()
+        private val nativeMutex = Mutex()
+        private val credentialCommitLock = Any()
+        @Volatile private var coreOwner: FoxyVpnService? = null
         const val ACTION_CONNECT = "com.vauth.foxyvpn.action.CONNECT"
         const val ACTION_DISCONNECT = "com.vauth.foxyvpn.action.DISCONNECT"
         private const val NOTIFICATION_ID = 1
         private const val REQUEST_CODE_OPEN = 0
         private const val REQUEST_CODE_DISCONNECT = 1
+
+        private val _proxyOnlyActive = MutableStateFlow(false)
+        val proxyOnlyActive: StateFlow<Boolean> = _proxyOnlyActive
 
         private val _state = MutableStateFlow(ConnectionState.DISCONNECTED)
         val state: StateFlow<ConnectionState> = _state
@@ -1279,37 +1304,37 @@ class FoxyVpnService : VpnService() {
         private val _vpnLiveStats = MutableStateFlow(VpnLiveStats())
         val vpnLiveStats: StateFlow<VpnLiveStats> = _vpnLiveStats
 
-        private val _connectedAtEpochMs = MutableStateFlow<Long?>(null)
-        val connectedAtEpochMs: StateFlow<Long?> = _connectedAtEpochMs
+        private val _connectedAtElapsedMs = MutableStateFlow<Long?>(null)
+        val connectedAtElapsedMs: StateFlow<Long?> = _connectedAtElapsedMs
 
         private val _pingLatencyMs = MutableStateFlow<Int?>(null)
         val pingLatencyMs: StateFlow<Int?> = _pingLatencyMs
 
+        private val _activeCandidate = MutableStateFlow<ProxyCandidate?>(null)
+        val activeCandidate: StateFlow<ProxyCandidate?> = _activeCandidate
+        private val _tunnelHealth = MutableStateFlow(TunnelHealth.UNKNOWN)
+        val tunnelHealth: StateFlow<TunnelHealth> = _tunnelHealth
+
         private val _vpnEdgeIp = MutableStateFlow<IpLocationInfo?>(null)
         val vpnEdgeIp: StateFlow<IpLocationInfo?> = _vpnEdgeIp
 
-        private val _connectedEndpoint = MutableStateFlow<Pair<String, Int>?>(null)
-        val connectedEndpoint: StateFlow<Pair<String, Int>?> = _connectedEndpoint
-
-        suspend fun pingNow(): Int? {
-            val endpoint = _connectedEndpoint.value ?: return null
-            val latency = PingUtil.measureTcpLatencyMs(endpoint.first, endpoint.second)
-            if (_state.value == ConnectionState.CONNECTED) {
-                _pingLatencyMs.value = latency
-            }
-            return latency
-        }
+        suspend fun pingNow(): Int? = coreOwner?.measureActiveLatency()
 
         fun start(context: Context) {
-            context.startForegroundService(Intent(context, FoxyVpnService::class.java).setAction(ACTION_CONNECT))
+            context.startForegroundService(
+                Intent(context, FoxyVpnService::class.java).setAction(ACTION_CONNECT)
+            )
         }
 
         fun stop(context: Context) {
-
             val intent = Intent(context, FoxyVpnService::class.java).setAction(ACTION_DISCONNECT)
             runCatching { context.startService(intent) }
                 .onFailure {
-                    AppLogger.w(TAG, "could not deliver the disconnect intent; the service is not running", it)
+                    AppLogger.w(
+                        TAG,
+                        "could not deliver the disconnect intent; service is not running",
+                        it,
+                    )
                 }
         }
     }

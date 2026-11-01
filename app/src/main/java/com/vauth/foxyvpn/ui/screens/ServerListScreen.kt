@@ -1,12 +1,13 @@
 package com.vauth.foxyvpn.ui.screens
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
@@ -17,38 +18,41 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.vauth.foxyvpn.R
 import com.vauth.foxyvpn.data.ProxyStateStore
 import com.vauth.foxyvpn.data.RECOMMENDED_COUNTRY_CODE
 import com.vauth.foxyvpn.data.ServerListClient
-import com.vauth.foxyvpn.data.model.ProxyCandidate
 import com.vauth.foxyvpn.data.model.VpnCountry
 import com.vauth.foxyvpn.data.model.emojiFlag
-import com.vauth.foxyvpn.vpn.PingUtil
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import com.vauth.foxyvpn.ui.ServerListViewModel
+import com.vauth.foxyvpn.ui.ServerPingState
 
 private sealed class LocationRow {
     data class RecommendedRow(val country: VpnCountry) : LocationRow()
+
     data class CountryHeader(val country: VpnCountry) : LocationRow()
+
     data class CityRow(val country: VpnCountry, val cityIndex: Int) : LocationRow()
 }
-
-private enum class PingState { PENDING, DONE, FAILED }
 
 @Composable
 fun ServerListScreen(
@@ -56,59 +60,72 @@ fun ServerListScreen(
     proxyStateStore: ProxyStateStore,
     onServerSelected: () -> Unit,
     onBack: () -> Unit,
+    viewModel: ServerListViewModel =
+        viewModel(factory = ServerListViewModel.factory(serverListClient, proxyStateStore)),
 ) {
-    var countries by remember { mutableStateOf<List<VpnCountry>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(true) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
+    ServerListScreen(
+        viewModel = viewModel,
+        proxyStateStore = proxyStateStore,
+        onServerSelected = onServerSelected,
+        onBack = onBack,
+    )
+}
 
-    val selectedState by proxyStateStore.selectedProxyFlow.collectAsState()
+@Composable
+fun ServerListScreen(
+    viewModel: ServerListViewModel,
+    proxyStateStore: ProxyStateStore,
+    onServerSelected: () -> Unit,
+    onBack: () -> Unit,
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val countries = state.countries
+    val isLoading = state.isLoading
+    val errorMessage = state.errorMessage
+    val selectedState by proxyStateStore.selectedProxyFlow.collectAsStateWithLifecycle()
+    val snackbarHost = remember { SnackbarHostState() }
+    val context = LocalContext.current
 
-    val pingResults = remember { mutableStateMapOf<String, Int>() }
-    val pingStates = remember { mutableStateMapOf<String, PingState>() }
-
-    LaunchedEffect(Unit) {
-        val cached = withContext(Dispatchers.IO) { serverListClient.loadCachedCountries() }
-        if (cached.isNotEmpty()) {
-            countries = cached
-            isLoading = false
-        }
-        runCatching { serverListClient.fetchCountries() }
-            .onSuccess { fresh ->
-                countries = fresh
-                errorMessage = null
-            }
-            .onFailure {
-                if (countries.isEmpty()) {
-                    errorMessage = it.message ?: "Failed to load server list"
-                }
-            }
-        isLoading = false
-    }
-
-    val ordered = remember(countries) {
-        countries.sortedWith(compareBy({ it.code != RECOMMENDED_COUNTRY_CODE }, { it.name }))
-    }
-
-    val rows = remember(ordered) {
-        buildList {
-            for (country in ordered) {
-                if (country.code == RECOMMENDED_COUNTRY_CODE) {
-                    add(LocationRow.RecommendedRow(country))
-                    continue
-                }
-                add(LocationRow.CountryHeader(country))
-                country.cities.indices.forEach { index -> add(LocationRow.CityRow(country, index)) }
-            }
+    LaunchedEffect(errorMessage) {
+        val message = errorMessage
+        if (message != null && countries.isNotEmpty()) {
+            snackbarHost.showSnackbar(message)
+            viewModel.clearError()
         }
     }
+
+    val ordered =
+        remember(countries) {
+            countries.sortedWith(compareBy({ it.code != RECOMMENDED_COUNTRY_CODE }, { it.name }))
+        }
+
+    val rows =
+        remember(ordered) {
+            buildList {
+                for (country in ordered) {
+                    if (country.code == RECOMMENDED_COUNTRY_CODE) {
+                        add(LocationRow.RecommendedRow(country))
+                        continue
+                    }
+                    add(LocationRow.CountryHeader(country))
+                    country.cities.indices.forEach { index ->
+                        add(LocationRow.CityRow(country, index))
+                    }
+                }
+            }
+        }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHost) },
         topBar = {
             TopAppBar(
-                title = { Text("Choose location") },
+                title = { Text(stringResource(R.string.server_list_title)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
                     }
                 },
             )
@@ -117,130 +134,201 @@ fun ServerListScreen(
         Box(Modifier.fillMaxSize().padding(padding)) {
             when {
                 isLoading -> CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
-                errorMessage != null && countries.isEmpty() -> Text(
-                    text = errorMessage.orEmpty(),
-                    textAlign = TextAlign.Center,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .fillMaxWidth()
-                        .padding(24.dp),
-                )
-                else -> LazyColumn {
-                    items(
-                        rows,
-                        key = { row ->
-                            when (row) {
-                                is LocationRow.RecommendedRow -> "recommended:${row.country.code}"
-                                is LocationRow.CountryHeader -> "country:${row.country.code}"
-                                is LocationRow.CityRow ->
-                                    "city:${row.country.code}:${row.country.cities[row.cityIndex].code}"
+                errorMessage != null && countries.isEmpty() ->
+                    Column(
+                        modifier = Modifier.align(Alignment.Center).padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            errorMessage,
+                            textAlign = TextAlign.Center,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        TextButton(
+                            onClick = {
+                                viewModel.loadServerList(force = true)
                             }
-                        },
-                    ) { row ->
-
-                        val selected = selectedState
-                        when (row) {
-                            is LocationRow.RecommendedRow -> ListItem(
-                                leadingContent = {
-                                    Icon(Icons.Filled.Public, contentDescription = null)
-                                },
-                                headlineContent = { Text("Recommended", fontWeight = FontWeight.SemiBold) },
-                                supportingContent = { Text("Automatically chosen for the best performance") },
-                                trailingContent = {
-                                    if (row.country.code == selected?.countryCode) {
-                                        Icon(Icons.Filled.CheckCircle, contentDescription = "Selected")
-                                    }
-                                },
-                                modifier = Modifier
-                                    .padding(horizontal = 8.dp)
-                                    .clickable {
-                                        val candidates = ServerListClient.candidatesForCountry(countries, row.country.code)
-                                        val chosen = candidates.randomOrNull()
-                                        if (chosen != null) {
-                                            proxyStateStore.save(chosen)
-                                            onServerSelected()
-                                        } else {
-                                            errorMessage = "No available servers for ${row.country.name}"
-                                        }
-                                    },
-                            )
-                            is LocationRow.CountryHeader -> ListItem(
-                                leadingContent = {
-                                    Text(
-                                        text = row.country.emojiFlag,
-                                        style = MaterialTheme.typography.titleLarge,
-                                    )
-                                },
-                                headlineContent = { Text(row.country.name, fontWeight = FontWeight.SemiBold) },
-                                modifier = Modifier.padding(horizontal = 8.dp),
-                            )
-                            is LocationRow.CityRow -> {
-                                val city = row.country.cities[row.cityIndex]
-                                val serverCount = city.servers.size
-
-                                val pingKey = "${row.country.code}:${city.code}"
-                                val pingMs = pingResults[pingKey]
-                                val pingState = pingStates[pingKey] ?: PingState.PENDING
-
-                                LaunchedEffect(pingKey) {
-                                    if (pingStates.containsKey(pingKey)) return@LaunchedEffect
-                                    val target = city.servers.firstOrNull { !it.quarantined }
-                                        ?.let { ServerListClient.defaultConnectTarget(it) }
-                                    if (target == null) {
-                                        pingStates[pingKey] = PingState.FAILED
-                                        return@LaunchedEffect
-                                    }
-                                    val result = PingUtil.measureTcpLatencyMs(target.first, target.second)
-                                    if (result != null) {
-                                        pingResults[pingKey] = result
-                                        pingStates[pingKey] = PingState.DONE
-                                    } else {
-                                        pingStates[pingKey] = PingState.FAILED
-                                    }
+                        ) {
+                            Text(stringResource(R.string.retry))
+                        }
+                    }
+                else ->
+                    LazyColumn(Modifier.selectableGroup()) {
+                        items(
+                            rows,
+                            key = { row ->
+                                when (row) {
+                                    is LocationRow.RecommendedRow ->
+                                        "recommended:${row.country.code}"
+                                    is LocationRow.CountryHeader -> "country:${row.country.code}"
+                                    is LocationRow.CityRow ->
+                                        "city:${row.country.code}:${row.country.cities[row.cityIndex].code}"
                                 }
-
-                                ListItem(
-
-                                    headlineContent = { Text(city.code) },
-                                    supportingContent = {
-                                        val primaryHostname = city.servers.firstOrNull()?.hostname
-                                        val serverLabel = when {
-                                            primaryHostname == null -> "No servers available"
-                                            serverCount > 1 -> "$primaryHostname (+${serverCount - 1} more)"
-                                            else -> primaryHostname
-                                        }
-                                        val pingLabel = when {
-                                            pingMs != null -> "$pingMs ms"
-                                            pingState == PingState.FAILED -> "ping unavailable"
-                                            else -> "pinging\u2026"
-                                        }
-                                        Text("$serverLabel \u2022 $pingLabel")
-                                    },
-                                    trailingContent = {
-                                        if (row.country.code == selected?.countryCode &&
-                                            city.code == selected?.cityCode
-                                        ) {
-                                            Icon(Icons.Filled.CheckCircle, contentDescription = "Selected")
-                                        }
-                                    },
-                                    modifier = Modifier
-                                        .padding(start = 24.dp, end = 8.dp)
-                                        .clickable {
-                                            val candidates = ServerListClient.candidatesForCity(countries, row.country.code, city.code)
-                                            val chosen = candidates.randomOrNull()
-                                            if (chosen != null) {
-                                                proxyStateStore.save(chosen)
-                                                onServerSelected()
-                                            } else {
-                                                errorMessage = "No available servers in ${city.code}"
+                            },
+                        ) { row ->
+                            val selected = selectedState
+                            when (row) {
+                                is LocationRow.RecommendedRow ->
+                                    ListItem(
+                                        leadingContent = {
+                                            Icon(Icons.Filled.Public, contentDescription = null)
+                                        },
+                                        headlineContent = {
+                                            Text(
+                                                stringResource(R.string.server_list_recommended_title),
+                                                fontWeight = FontWeight.SemiBold,
+                                            )
+                                        },
+                                        supportingContent = {
+                                            Text(stringResource(R.string.server_list_recommended_desc))
+                                        },
+                                        trailingContent = {
+                                            if (row.country.code == selected?.countryCode) {
+                                                Icon(
+                                                    Icons.Filled.CheckCircle,
+                                                    contentDescription = null,
+                                                )
                                             }
                                         },
-                                )
+                                        modifier =
+                                            Modifier.padding(horizontal = 8.dp)
+                                                .selectable(
+                                                    selected =
+                                                        row.country.code == selected?.countryCode,
+                                                    role = Role.RadioButton,
+                                                    onClick = {
+                                                        val candidates =
+                                                            ServerListClient.candidatesForCountry(
+                                                                countries,
+                                                                row.country.code,
+                                                            )
+                                                        val chosen = candidates.randomOrNull()
+                                                        if (chosen != null) {
+                                                            viewModel.selectCandidate(chosen)
+                                                            onServerSelected()
+                                                        } else {
+                                                            viewModel.setErrorMessage(
+                                                                context.getString(
+                                                                    R.string.server_list_no_servers_country,
+                                                                    row.country.name,
+                                                                )
+                                                            )
+                                                        }
+                                                    },
+                                                ),
+                                    )
+                                is LocationRow.CountryHeader ->
+                                    ListItem(
+                                        leadingContent = {
+                                            Text(
+                                                text = row.country.emojiFlag,
+                                                style = MaterialTheme.typography.titleLarge,
+                                            )
+                                        },
+                                        headlineContent = {
+                                            Text(row.country.name, fontWeight = FontWeight.SemiBold)
+                                        },
+                                        modifier = Modifier.padding(horizontal = 8.dp),
+                                    )
+                                is LocationRow.CityRow -> {
+                                    val city = row.country.cities[row.cityIndex]
+                                    val available =
+                                        remember(countries, row.country.code, city.code) {
+                                            ServerListClient.candidatesForCity(
+                                                countries,
+                                                row.country.code,
+                                                city.code,
+                                            )
+                                        }
+                                    val serverCount = available.size
+
+                                    val pingKey = "${row.country.code}:${city.code}"
+                                    val pingMs = state.pingResults[pingKey]
+                                    val pingState =
+                                        state.pingStates[pingKey] ?: ServerPingState.PENDING
+
+                                    LaunchedEffect(pingKey, available, state.directoryRevision) {
+                                        viewModel.probeCityLatency(
+                                            row.country.code,
+                                            city.code,
+                                            available,
+                                        )
+                                    }
+
+                                    ListItem(
+                                        headlineContent = { Text(city.code) },
+                                        supportingContent = {
+                                            val primaryHostname = available.firstOrNull()?.host
+                                            val serverLabel =
+                                                when {
+                                                    primaryHostname == null ->
+                                                        stringResource(R.string.server_list_no_servers_available)
+                                                    serverCount > 1 ->
+                                                        stringResource(
+                                                            R.string.server_list_more_servers,
+                                                            primaryHostname,
+                                                            serverCount - 1,
+                                                        )
+                                                    else -> primaryHostname
+                                                }
+                                            val pingLabel =
+                                                when {
+                                                    pingMs != null ->
+                                                        stringResource(
+                                                            R.string.server_list_tcp_ms,
+                                                            pingMs,
+                                                        )
+                                                    pingState == ServerPingState.FAILED ->
+                                                        stringResource(R.string.server_list_tcp_unavailable)
+                                                    else ->
+                                                        stringResource(R.string.server_list_checking_tcp)
+                                                }
+                                            Text("$serverLabel \u2022 $pingLabel")
+                                        },
+                                        trailingContent = {
+                                            if (
+                                                row.country.code == selected?.countryCode &&
+                                                    city.code == selected?.cityCode
+                                            ) {
+                                                Icon(
+                                                    Icons.Filled.CheckCircle,
+                                                    contentDescription = null,
+                                                )
+                                            }
+                                        },
+                                        modifier =
+                                            Modifier.padding(start = 24.dp, end = 8.dp)
+                                                .selectable(
+                                                    selected =
+                                                        row.country.code == selected?.countryCode &&
+                                                            city.code == selected?.cityCode,
+                                                    role = Role.RadioButton,
+                                                    onClick = {
+                                                        val candidates =
+                                                            ServerListClient.candidatesForCity(
+                                                                countries,
+                                                                row.country.code,
+                                                                city.code,
+                                                            )
+                                                        val chosen = candidates.randomOrNull()
+                                                        if (chosen != null) {
+                                                            viewModel.selectCandidate(chosen)
+                                                            onServerSelected()
+                                                        } else {
+                                                            viewModel.setErrorMessage(
+                                                                context.getString(
+                                                                    R.string.server_list_no_servers_city,
+                                                                    city.code,
+                                                                )
+                                                            )
+                                                        }
+                                                    },
+                                                ),
+                                    )
+                                }
                             }
                         }
                     }
-                }
             }
         }
     }

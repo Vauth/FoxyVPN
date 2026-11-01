@@ -17,8 +17,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vauth.foxyvpn.R
 import com.vauth.foxyvpn.data.FxaAuthRepository
 import com.vauth.foxyvpn.data.SessionStatus
 import kotlinx.coroutines.delay
@@ -34,9 +36,9 @@ fun SplashScreen(
 ) {
     LaunchedEffect(Unit) {
         delay(500)
-        val status = withTimeoutOrNull(SESSION_RESTORE_TIMEOUT_MS) {
-            authRepository.restoreSession()
-        } ?: SessionStatus.UNREACHABLE
+        val status =
+            withTimeoutOrNull(SESSION_RESTORE_TIMEOUT_MS) { authRepository.restoreSession() }
+                ?: SessionStatus.UNREACHABLE
 
         when (status) {
             SessionStatus.ACTIVE -> onSignedIn()
@@ -54,11 +56,13 @@ fun SplashScreen(
                 tint = MaterialTheme.colorScheme.primary,
             )
             Spacer(Modifier.height(16.dp))
-            Text("FoxyVPN", fontSize = 28.sp, color = MaterialTheme.colorScheme.onSurface)
+            Text(
+                stringResource(R.string.app_name),
+                fontSize = 28.sp,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
             CircularProgressIndicator(
-                modifier = Modifier
-                    .padding(top = 24.dp)
-                    .size(24.dp),
+                modifier = Modifier.padding(top = 24.dp).size(24.dp),
                 strokeWidth = 2.dp,
                 color = MaterialTheme.colorScheme.primary,
             )

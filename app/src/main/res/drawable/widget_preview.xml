@@ -8,7 +8,7 @@
         </shape>
     </item>
     <item
-        android:drawable="@android:drawable/ic_lock_lock"
+        android:drawable="@drawable/ic_power"
         android:gravity="center"
         android:top="16dp"
         android:bottom="16dp"

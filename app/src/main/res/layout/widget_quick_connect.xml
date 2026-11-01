@@ -7,6 +7,8 @@
 
     <ImageView
         android:id="@+id/widget_background"
+        android:importantForAccessibility="no"
+        android:contentDescription="@null"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:layout_gravity="center"
@@ -20,7 +22,7 @@
         android:layout_gravity="center"
         android:scaleType="fitCenter"
         android:padding="16dp"
-        android:src="@android:drawable/ic_lock_lock"
+        android:src="@drawable/ic_power"
         android:contentDescription="@string/quick_connect" />
 
 </FrameLayout>
