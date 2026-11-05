@@ -23,8 +23,8 @@ android {
         applicationId = "com.vauth.foxyvpn"
         minSdk = 26
         targetSdk = 35
-        versionCode = 46
-        versionName = "2.0.0"
+        versionCode = 47
+        versionName = "2.0.1"
     }
 
     splits {

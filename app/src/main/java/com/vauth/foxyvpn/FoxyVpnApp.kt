@@ -4,6 +4,7 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.res.Configuration
+import com.vauth.foxyvpn.data.ControlPlaneHttp
 import com.vauth.foxyvpn.data.CrashReporter
 import com.vauth.foxyvpn.data.FxaAuthRepository
 import com.vauth.foxyvpn.data.GuardianClient
@@ -50,20 +51,33 @@ class FoxyVpnApp : Application(), AppContainer {
         tokenStore = TokenStore(this)
         proxyStateStore = ProxyStateStore(this)
         settingsStore = SettingsStore(this)
+        ControlPlaneHttp.bootstrapDnsConfigProvider = {
+            settingsStore.bootstrapDnsProvider to settingsStore.effectiveBootstrapDohUrl
+        }
         guardianClient = GuardianClient()
         serverListClient = ServerListClient(this)
         authRepository = FxaAuthRepository(tokenStore)
-        createNotificationChannel()
+        createNotificationChannels()
     }
 
-    private fun createNotificationChannel() {
-        val channel =
+    private fun createNotificationChannels() {
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        val vpnChannel =
             NotificationChannel(
                 VPN_NOTIFICATION_CHANNEL_ID,
                 "VPN status",
                 NotificationManager.IMPORTANCE_LOW,
             )
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val updateChannel =
+            NotificationChannel(
+                UPDATE_NOTIFICATION_CHANNEL_ID,
+                getString(R.string.update_notification_channel_name),
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = getString(R.string.update_notification_channel_desc)
+            }
+        manager.createNotificationChannel(vpnChannel)
+        manager.createNotificationChannel(updateChannel)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -73,5 +87,6 @@ class FoxyVpnApp : Application(), AppContainer {
 
     companion object {
         const val VPN_NOTIFICATION_CHANNEL_ID = "foxyvpn_status"
+        const val UPDATE_NOTIFICATION_CHANNEL_ID = "foxyvpn_updates"
     }
 }

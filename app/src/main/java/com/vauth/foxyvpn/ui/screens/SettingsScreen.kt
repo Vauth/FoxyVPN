@@ -17,7 +17,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Logout
+import android.widget.Toast
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -55,12 +57,14 @@ import com.vauth.foxyvpn.ui.settings.ConcurrencyPickerDialog
 import com.vauth.foxyvpn.ui.settings.CustomEdgeAddressDialog
 import com.vauth.foxyvpn.ui.settings.DnsProviderPickerDialog
 import com.vauth.foxyvpn.ui.settings.HttpVersionPickerDialog
+import com.vauth.foxyvpn.ui.settings.IpModePickerDialog
 import com.vauth.foxyvpn.ui.settings.LatencyProbeDialog
 import com.vauth.foxyvpn.ui.settings.MtuPickerDialog
 import com.vauth.foxyvpn.ui.settings.ProxySettingsDialog
 import com.vauth.foxyvpn.ui.settings.SplitTunnelDialog
 import com.vauth.foxyvpn.ui.settings.TlsFragmentPickerDialog
 import com.vauth.foxyvpn.ui.settings.UtlsFingerprintPickerDialog
+import com.vauth.foxyvpn.update.ReleaseInfo
 import com.vauth.foxyvpn.vpn.FoxyVpnService
 import com.vauth.foxyvpn.vpn.TunnelHealth
 
@@ -74,9 +78,11 @@ private enum class SettingsDialog {
     CONCURRENCY,
     MTU,
     DNS_PROVIDER,
+    BOOTSTRAP_DNS_PROVIDER,
     EDGE_ADDRESS,
     SPLIT_TUNNEL,
     HTTP_VERSION,
+    IP_MODE,
 }
 
 @Composable
@@ -87,6 +93,8 @@ fun SettingsScreen(
     onBack: () -> Unit,
     signOutInProgress: Boolean = false,
     onCheckForUpdates: (() -> Unit)? = null,
+    manualUpdate: ReleaseInfo? = null,
+    onDismissUpdateDialog: () -> Unit = {},
     automaticUpdates: Boolean = false,
     onAutomaticUpdatesChange: ((Boolean) -> Unit)? = null,
 ) {
@@ -95,6 +103,8 @@ fun SettingsScreen(
     val health by FoxyVpnService.tunnelHealth.collectAsStateWithLifecycle()
     var dnsProvider by remember { mutableStateOf(settingsStore.dnsProvider) }
     var customDohUrl by remember { mutableStateOf(settingsStore.customDohUrl) }
+    var bootstrapDnsProvider by remember { mutableStateOf(settingsStore.bootstrapDnsProvider) }
+    var customBootstrapDohUrl by remember { mutableStateOf(settingsStore.customBootstrapDohUrl) }
     var proxyOnlyMode by remember { mutableStateOf(settingsStore.proxyOnlyMode) }
     var customEdgeAddress by remember { mutableStateOf(settingsStore.customEdgeAddress) }
     var excludedApps by remember { mutableStateOf(settingsStore.excludedApps) }
@@ -107,9 +117,8 @@ fun SettingsScreen(
     var tlsFragmentMode by remember { mutableStateOf(settingsStore.tlsFragmentMode) }
     var fragmentFallbackDelay by remember { mutableIntStateOf(settingsStore.fragmentFallbackDelay) }
     var utlsFingerprint by remember { mutableStateOf(settingsStore.utlsFingerprint) }
-    var tcpFastOpen by remember { mutableStateOf(settingsStore.tcpFastOpen) }
     var maxConcurrentStreams by remember { mutableIntStateOf(settingsStore.maxConcurrentStreams) }
-    var ipv6Enabled by remember { mutableStateOf(settingsStore.ipv6Enabled) }
+    var ipMode by remember { mutableStateOf(settingsStore.ipMode) }
     var activeDialog by rememberSaveable { mutableStateOf(SettingsDialog.NONE) }
 
     val proxyViewModel: ProxySettingsViewModel =
@@ -127,6 +136,44 @@ fun SettingsScreen(
         proxyViewModel::save,
         proxyViewModel::save,
     )
+
+    if (manualUpdate != null) {
+        val release = manualUpdate
+        AlertDialog(
+            onDismissRequest = onDismissUpdateDialog,
+            title = { Text(stringResource(R.string.update_dialog_title)) },
+            text = {
+                Text(stringResource(R.string.update_notification_text, release.tag))
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDismissUpdateDialog()
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(release.htmlUrl)).apply {
+                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                }
+                            )
+                        }.onFailure {
+                            Toast.makeText(
+                                context,
+                                context.getString(R.string.browser_unavailable),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
+                ) {
+                    Text(stringResource(R.string.update_btn_view_release))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismissUpdateDialog) {
+                    Text(stringResource(R.string.update_dialog_dismiss))
+                }
+            },
+        )
+    }
 
     when (activeDialog) {
         SettingsDialog.NONE -> {}
@@ -171,7 +218,7 @@ fun SettingsScreen(
         )
         SettingsDialog.MTU -> MtuPickerDialog(
             current = mtu,
-            minimum = if (ipv6Enabled) 1280 else SettingsStore.MIN_MTU,
+            minimum = if (ipMode.hasIpv6) 1280 else SettingsStore.MIN_MTU,
             onDismiss = { activeDialog = SettingsDialog.NONE },
             onConfirm = {
                 mtu = it
@@ -187,6 +234,19 @@ fun SettingsScreen(
                 settingsStore.saveDns(provider, url)
                 dnsProvider = provider
                 customDohUrl = settingsStore.customDohUrl
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.BOOTSTRAP_DNS_PROVIDER -> DnsProviderPickerDialog(
+            title = stringResource(R.string.settings_bootstrap_dns_provider),
+            helpText = stringResource(R.string.dialog_dns_bootstrap_help),
+            currentProvider = bootstrapDnsProvider,
+            currentCustomUrl = customBootstrapDohUrl,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = { provider, url ->
+                settingsStore.saveBootstrapDns(provider, url)
+                bootstrapDnsProvider = provider
+                customBootstrapDohUrl = settingsStore.customBootstrapDohUrl
                 activeDialog = SettingsDialog.NONE
             },
         )
@@ -218,6 +278,19 @@ fun SettingsScreen(
             onConfirm = {
                 httpVersion = it
                 settingsStore.httpVersion = it
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.IP_MODE -> IpModePickerDialog(
+            current = ipMode,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = {
+                if (it.hasIpv6 && mtu < 1280) {
+                    settingsStore.mtu = 1280
+                    mtu = 1280
+                }
+                settingsStore.ipMode = it
+                ipMode = it
                 activeDialog = SettingsDialog.NONE
             },
         )
@@ -298,6 +371,22 @@ fun SettingsScreen(
                 },
                 modifier = Modifier.clickable { activeDialog = SettingsDialog.DNS_PROVIDER },
             )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_bootstrap_dns_provider)) },
+                supportingContent = {
+                    val subtitle =
+                        when (bootstrapDnsProvider) {
+                            SettingsStore.DnsProvider.CUSTOM ->
+                                customBootstrapDohUrl.ifBlank { "Custom DoH" }
+                            else -> bootstrapDnsProvider.label
+                        }
+                    Text(subtitle)
+                },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.BOOTSTRAP_DNS_PROVIDER },
+            )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
             SectionLabel(stringResource(R.string.proxy))
@@ -329,7 +418,7 @@ fun SettingsScreen(
                         else
                             stringResource(
                                 R.string.local_proxy_summary,
-                                SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS,
+                                summary.localBindAddress,
                                 summary.localPort,
                             )
                     )
@@ -470,7 +559,9 @@ fun SettingsScreen(
                 headlineContent = { Text(stringResource(R.string.settings_tls_fragmentation)) },
                 supportingContent = {
                     Text(
-                        if (tlsFragmentMode == SettingsStore.TlsFragmentMode.OFF) {
+                        if (httpVersion == SettingsStore.HttpVersion.HTTP_3) {
+                            stringResource(R.string.settings_tcp_only_notice)
+                        } else if (tlsFragmentMode == SettingsStore.TlsFragmentMode.OFF) {
                             stringResource(R.string.settings_disabled)
                         } else if (tlsFragmentMode == SettingsStore.TlsFragmentMode.RECORD) {
                             tlsFragmentMode.label
@@ -488,7 +579,15 @@ fun SettingsScreen(
                 headlineContent = {
                     Text(stringResource(R.string.settings_browser_tls_fingerprint))
                 },
-                supportingContent = { Text(utlsFingerprint.label) },
+                supportingContent = {
+                    Text(
+                        if (httpVersion == SettingsStore.HttpVersion.HTTP_3) {
+                            "${utlsFingerprint.label} • ${stringResource(R.string.settings_tcp_only_notice)}"
+                        } else {
+                            utlsFingerprint.label
+                        }
+                    )
+                },
                 trailingContent = {
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
@@ -497,36 +596,36 @@ fun SettingsScreen(
             ListItem(
                 headlineContent = { Text(stringResource(R.string.settings_multiplex_concurrency)) },
                 supportingContent = {
-                    Text(pluralStringResource(R.plurals.stream_count, maxConcurrentStreams, maxConcurrentStreams))
+                    Text(
+                        if (httpVersion != SettingsStore.HttpVersion.HTTP_2) {
+                            "${pluralStringResource(R.plurals.stream_count, maxConcurrentStreams, maxConcurrentStreams)} • ${stringResource(R.string.settings_http2_only_notice)}"
+                        } else {
+                            pluralStringResource(R.plurals.stream_count, maxConcurrentStreams, maxConcurrentStreams)
+                        }
+                    )
                 },
                 trailingContent = {
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
                 modifier = Modifier.clickable { activeDialog = SettingsDialog.CONCURRENCY },
             )
-            SettingsToggle(
-                title = stringResource(R.string.settings_tcp_fast_open),
-                summary = stringResource(R.string.settings_tcp_fast_open_help),
-                checked = tcpFastOpen,
-                onCheckedChange = {
-                    settingsStore.tcpFastOpen = it
-                    tcpFastOpen = it
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_ip_mode)) },
+                supportingContent = {
+                    Text(
+                        when (ipMode) {
+                            SettingsStore.IpMode.DUAL_STACK -> stringResource(R.string.ip_mode_dual_stack)
+                            SettingsStore.IpMode.PREFER_IPV4 -> stringResource(R.string.ip_mode_prefer_ipv4)
+                            SettingsStore.IpMode.PREFER_IPV6 -> stringResource(R.string.ip_mode_prefer_ipv6)
+                            SettingsStore.IpMode.IPV4_ONLY -> stringResource(R.string.ip_mode_ipv4_only)
+                            SettingsStore.IpMode.IPV6_ONLY -> stringResource(R.string.ip_mode_ipv6_only)
+                        }
+                    )
                 },
-            )
-            SettingsToggle(
-                title = stringResource(R.string.settings_ipv6_tunnel),
-                summary =
-                    if (ipv6Enabled) stringResource(R.string.settings_dual_stack)
-                    else stringResource(R.string.settings_ipv4_only),
-                checked = ipv6Enabled,
-                onCheckedChange = {
-                    if (it && mtu < 1280) {
-                        settingsStore.mtu = 1280
-                        mtu = 1280
-                    }
-                    settingsStore.ipv6Enabled = it
-                    ipv6Enabled = it
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.IP_MODE },
             )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))

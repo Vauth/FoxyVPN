@@ -179,7 +179,7 @@ class SettingsStore(context: Context) {
     }
 
     val socksBindAddress: String
-        get() = DEFAULT_SOCKS_BIND_ADDRESS
+        get() = prefs.getString(KEY_SOCKS_BIND_ADDRESS, DEFAULT_SOCKS_BIND_ADDRESS) ?: DEFAULT_SOCKS_BIND_ADDRESS
 
     val socksPort: Int
         get() =
@@ -235,6 +235,47 @@ class SettingsStore(context: Context) {
                 else -> dnsProvider.dohUrl
             }
 
+    var bootstrapDnsProvider: DnsProvider
+        get() {
+            val saved = prefs.getString(KEY_BOOTSTRAP_DNS_PROVIDER, null)
+            if (saved == null) return DnsProvider.DIRECT_SYSTEM
+            return DnsProvider.entries.firstOrNull { it.name == saved } ?: DnsProvider.DIRECT_SYSTEM
+        }
+        set(value) {
+            prefs.edit().putString(KEY_BOOTSTRAP_DNS_PROVIDER, value.name).apply()
+        }
+
+    var customBootstrapDohUrl: String
+        get() = prefs.getString(KEY_CUSTOM_BOOTSTRAP_DOH_URL, "") ?: ""
+        set(value) {
+            val trimmed = value.trim()
+            if (trimmed.isNotEmpty() && !isValidDohUrl(trimmed)) return
+            prefs.edit().putString(KEY_CUSTOM_BOOTSTRAP_DOH_URL, trimmed).apply()
+        }
+
+    fun saveBootstrapDns(provider: DnsProvider, customUrl: String) {
+        val url = customUrl.trim()
+        require(provider != DnsProvider.CUSTOM || isValidDohUrl(url)) {
+            "Enter a valid HTTPS DoH URL"
+        }
+        val savedUrl =
+            url.takeIf { it.isEmpty() || isValidDohUrl(it) }
+                ?: customBootstrapDohUrl.takeIf { isValidDohUrl(it) }.orEmpty()
+        prefs
+            .edit()
+            .putString(KEY_BOOTSTRAP_DNS_PROVIDER, provider.name)
+            .putString(KEY_CUSTOM_BOOTSTRAP_DOH_URL, savedUrl)
+            .apply()
+    }
+
+    val effectiveBootstrapDohUrl: String
+        get() =
+            when (bootstrapDnsProvider) {
+                DnsProvider.CUSTOM -> customBootstrapDohUrl
+                DnsProvider.DIRECT_SYSTEM -> ""
+                else -> bootstrapDnsProvider.dohUrl
+            }
+
     var tlsFragmentMode: TlsFragmentMode
         get() =
             TlsFragmentMode.entries.firstOrNull {
@@ -259,22 +300,33 @@ class SettingsStore(context: Context) {
             prefs.edit().putString(KEY_UTLS_FINGERPRINT, value.name).apply()
         }
 
-    var tcpFastOpen: Boolean
-        get() = prefs.getBoolean(KEY_TCP_FAST_OPEN, false)
-        set(value) {
-            prefs.edit().putBoolean(KEY_TCP_FAST_OPEN, value).apply()
-        }
-
     var maxConcurrentStreams: Int
         get() = prefs.getInt(KEY_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_CONCURRENT_STREAMS)
         set(value) {
             prefs.edit().putInt(KEY_MAX_CONCURRENT_STREAMS, value.coerceIn(2, 128)).apply()
         }
 
-    var ipv6Enabled: Boolean
-        get() = prefs.getBoolean(KEY_IPV6_ENABLED, false)
+    var ipMode: IpMode
+        get() {
+            val raw = prefs.getString(KEY_IP_MODE, null)
+            if (raw != null) {
+                return IpMode.entries.firstOrNull { it.id == raw || it.name == raw }
+                    ?: IpMode.DUAL_STACK
+            }
+            if (prefs.contains(KEY_IPV6_ENABLED)) {
+                return if (prefs.getBoolean(KEY_IPV6_ENABLED, true)) IpMode.DUAL_STACK
+                else IpMode.IPV4_ONLY
+            }
+            return IpMode.DUAL_STACK
+        }
         set(value) {
-            prefs.edit().putBoolean(KEY_IPV6_ENABLED, value).apply()
+            prefs.edit().putString(KEY_IP_MODE, value.id).apply()
+        }
+
+    var ipv6Enabled: Boolean
+        get() = ipMode.hasIpv6
+        set(value) {
+            ipMode = if (value) IpMode.DUAL_STACK else IpMode.IPV4_ONLY
         }
 
     var proxyOnlyMode: Boolean
@@ -333,6 +385,12 @@ class SettingsStore(context: Context) {
                 "Choose a valid listener port, excluding controller port $CONTROLLER_PORT"
             }
             require(
+                options.bindAddress == DEFAULT_SOCKS_BIND_ADDRESS ||
+                    options.bindAddress == ALL_INTERFACES_BIND_ADDRESS,
+            ) {
+                "Choose a valid listen address ($DEFAULT_SOCKS_BIND_ADDRESS or $ALL_INTERFACES_BIND_ADDRESS)"
+            }
+            require(
                 !options.authentication ||
                     isValidLocalProxyCredentials(options.username, options.password)
             ) {
@@ -355,6 +413,7 @@ class SettingsStore(context: Context) {
             check(
                 prefs
                     .edit()
+                    .putString(KEY_SOCKS_BIND_ADDRESS, options.bindAddress)
                     .putInt(KEY_SOCKS_PORT, options.port)
                     .putBoolean("local_proxy_auth_enabled", options.authentication)
                     .commit()
@@ -466,8 +525,32 @@ class SettingsStore(context: Context) {
             .putStringSet(KEY_INCLUDED_APPS, HashSet(included))
             .apply()
     }
+    enum class IpMode(val id: String) {
+        DUAL_STACK("dual_stack"),
+        PREFER_IPV4("prefer_ipv4"),
+        PREFER_IPV6("prefer_ipv6"),
+        IPV4_ONLY("ipv4_only"),
+        IPV6_ONLY("ipv6_only");
+
+        val hasIpv4: Boolean
+            get() = this != IPV6_ONLY
+
+        val hasIpv6: Boolean
+            get() = this != IPV4_ONLY
+
+        val dnsStrategy: String?
+            get() =
+                when (this) {
+                    DUAL_STACK -> null
+                    PREFER_IPV4 -> "prefer_ipv4"
+                    PREFER_IPV6 -> "prefer_ipv6"
+                    IPV4_ONLY -> "ipv4_only"
+                    IPV6_ONLY -> "ipv6_only"
+                }
+    }
 
     enum class HttpVersion(val versionNumber: Int, val label: String, val description: String) {
+        HTTP_1(versionNumber = 1, label = "HTTP/1.1", description = "Classic HTTP proxy over TLS"),
         HTTP_2(versionNumber = 2, label = "HTTP/2", description = "Multiplexed streams over TCP"),
         HTTP_3(versionNumber = 3, label = "HTTP/3", description = "QUIC transport over UDP"),
     }
@@ -540,11 +623,13 @@ class SettingsStore(context: Context) {
         private const val KEY_SOCKS_PORT = "socks_port"
         private const val KEY_DNS_PROVIDER = "dns_provider"
         private const val KEY_CUSTOM_DOH_URL = "custom_doh_url"
+        private const val KEY_BOOTSTRAP_DNS_PROVIDER = "bootstrap_dns_provider"
+        private const val KEY_CUSTOM_BOOTSTRAP_DOH_URL = "custom_bootstrap_doh_url"
         private const val KEY_TLS_FRAGMENT_MODE = "tls_fragment_mode"
         private const val KEY_FRAGMENT_FALLBACK_DELAY = "fragment_fallback_delay"
         private const val KEY_UTLS_FINGERPRINT = "utls_fingerprint"
-        private const val KEY_TCP_FAST_OPEN = "tcp_fast_open"
         private const val KEY_MAX_CONCURRENT_STREAMS = "max_concurrent_streams"
+        private const val KEY_IP_MODE = "ip_mode"
         private const val KEY_IPV6_ENABLED = "ipv6_enabled"
         const val DEFAULT_FRAGMENT_FALLBACK_DELAY = 300
         const val DEFAULT_MAX_CONCURRENT_STREAMS = 32
@@ -562,6 +647,8 @@ class SettingsStore(context: Context) {
         private const val KEY_HTTP_VERSION = "http_version"
         const val CONTROLLER_PORT = 9090
         const val DEFAULT_SOCKS_BIND_ADDRESS = "127.0.0.1"
+        const val ALL_INTERFACES_BIND_ADDRESS = "0.0.0.0"
+        private const val KEY_SOCKS_BIND_ADDRESS = "socks_bind_address"
         const val DEFAULT_SOCKS_PORT = 1080
         const val DEFAULT_UPSTREAM_PROXY_PORT = 1080
 
@@ -597,7 +684,8 @@ class SettingsStore(context: Context) {
                     (isValidIpAddress(normalized) &&
                         runCatching { java.net.InetAddress.getByName(normalized).isLoopbackAddress }
                             .getOrDefault(false))
-            return loopback && (port == mixedPort || port == CONTROLLER_PORT)
+            val isLocal = loopback || normalized == "0.0.0.0" || normalized == "::"
+            return isLocal && (port == mixedPort || port == CONTROLLER_PORT)
         }
 
         fun isValidLocalProxyCredentials(username: String, password: String): Boolean =

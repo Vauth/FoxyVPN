@@ -8,6 +8,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
@@ -114,14 +115,17 @@ fun FoxyNavGraph(
             val app = context.applicationContext as? com.vauth.foxyvpn.FoxyVpnApp
             val updater = app?.appUpdater
             var autoUpdates by remember { mutableStateOf(updater?.automaticChecks ?: false) }
+            val manualUpdate by updater?.manualUpdate?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(null) }
             SettingsScreen(
                 settingsStore = container.settingsStore,
                 onOpenLogs = { navController.navigate(FoxyRoutes.LOGS) },
                 signOutInProgress = signingOut,
                 onCheckForUpdates = {
-                    updater?.showPrompt()
-                    updater?.check()
+                    updater?.check(automatic = false)
                 },
+                manualUpdate = manualUpdate,
+                onDismissUpdateDialog = { updater?.dismissManualUpdate() },
                 automaticUpdates = autoUpdates,
                 onAutomaticUpdatesChange = { enabled ->
                     updater?.automaticChecks = enabled
