@@ -339,12 +339,12 @@ class FoxyVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_CONNECT
         if (action == ACTION_CONNECT || action == VpnService.SERVICE_INTERFACE) {
-            if (stopping) return START_NOT_STICKY
             if (_state.value != ConnectionState.DISCONNECTED) {
                 AppLogger.d(TAG, "ignoring duplicate connect request while ${_state.value}")
                 enterForeground(statusLabel)
                 return START_STICKY
             }
+            stopping = false
             _state.value = ConnectionState.CONNECTING
             _lastError.value = null
             statusLabel = "Connecting\u2026"
@@ -612,10 +612,13 @@ class FoxyVpnService : VpnService() {
                 ensureGenerationCurrent(myGeneration)
 
                 val socksPort = tunnelSettings.socksPort
-                ListenerAvailability.requireAvailable(
-                    listOf(socksPort, SettingsStore.CONTROLLER_PORT)
-                )
                 val socksBindAddress = tunnelSettings.socksBindAddress
+                ListenerAvailability.requireAvailable(
+                    listOf(
+                        socksBindAddress to socksPort,
+                        SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS to SettingsStore.CONTROLLER_PORT,
+                    )
+                )
 
                 val proxyOnlyMode = tunnelSettings.proxyOnlyMode
                 nativeProtectionRequired = !proxyOnlyMode

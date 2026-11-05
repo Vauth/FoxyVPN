@@ -127,8 +127,13 @@ class FoxyPlatformInterface(
                 }
             }
             if (!addedDns) {
-                builder.addDnsServer("172.19.0.2")
-                builder.addRoute("172.19.0.2", 32)
+                if (hasIpv4) {
+                    builder.addDnsServer("172.19.0.2")
+                    builder.addRoute("172.19.0.2", 32)
+                } else if (hasIpv6) {
+                    builder.addDnsServer("fdfe:dcba:9876::2")
+                    builder.addRoute("fdfe:dcba:9876::2", 128)
+                }
             }
         }
 

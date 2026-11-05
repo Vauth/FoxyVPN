@@ -12,7 +12,7 @@
 ![Sing-Box](https://img.shields.io/badge/Sing--Box-212121?style=for-the-badge&logo=go&logoColor=white)
 ![License](https://img.shields.io/badge/License_MIT-212121?style=for-the-badge)
 
-*FoxyVPN is a modern, privacy-focused Android client for Mozilla's Firefox VPN service. Powered by a customized sing-box core, it connects directly to Mozilla's global Fastly edge network using high-performance MASQUE protocol with HTTP/2 and HTTP/3 support.*
+*FoxyVPN is a modern, privacy-focused Android client for Mozilla's Firefox VPN service. Powered by a customized sing-box core, it connects directly to Mozilla's global Fastly edge network using high-performance MASQUE protocol with HTTP/1.1, HTTP/2, and HTTP/3 support.*
 
 </div>
 
@@ -22,28 +22,31 @@
 
 ### Core & Privacy
 - **Firefox Account Integration**
-- **System-Wide Tunneling**
-- **Split Tunneling**
-- **DNS-over-HTTPS (DoH)**
+- **System-Wide VPN Tunneling**
+- **Split Tunneling (Per-App Selection)**
+- **IP Protocol Modes (Dual-Stack, Prefer IPv4/IPv6, IPv4/IPv6-Only)**
+- **Local HTTP / SOCKS5 Proxy Server & LAN Sharing**
+- **Custom & Bootstrap DNS-over-HTTPS (DoH)**
 - **Local Network Bypass**
 - **Proxy-Only Mode**
 
 ### Performance & Censorship Resistance
-- **TLS Fragmentation**
+- **MASQUE over HTTP/1.1, HTTP/2, and HTTP/3 (QUIC)**
+- **TLS Fragmentation (Record & Packet)**
 - **uTLS Fingerprint Emulation**
 - **Upstream Proxy Chaining**
 - **Custom Edge Override**
-- **TCP Fast Open (TFO)**
-- **Multiplexing Controls**
+- **Multiplexing & Concurrency Controls**
 - **Custom Tunnel MTU**
+- **Automatic Connection Recovery**
 
 ### User Experience & System Integration
-- **Real-Time Diagnostics**
+- **Real-Time Traffic & Latency Diagnostics**
 - **Public & Exit IP Detection**
-- **Global Locations**
-- **Quick Settings Tile & Widget**
-- **In-App Auto-Updates**
-- **Diagnostic Logging**
+- **Global Server Locations**
+- **Quick Settings Tile & Home Screen Widget**
+- **Release Update Checks & Notifications**
+- **Diagnostic Logging & Export**
 
 <br>
 
@@ -86,8 +89,8 @@
 2. Download and verify the pinned sing-box core (`libbox.aar`):
    ```bash
    mkdir -p app/libs
-   curl -L -o app/libs/libbox.aar https://github.com/Vauth/sing-box/releases/download/v1.15.0-foxy-masque.2/libbox.aar
-   echo "f1b59f4fab207b4c19f8ea3d145bc4dd0e834a530081d0dc045f4b795d6eac0b  app/libs/libbox.aar" | sha256sum --check --strict
+   curl -L -o app/libs/libbox.aar https://github.com/Vauth/sing-box/releases/download/v1.0.0-masque/libbox.aar
+   echo "a6a28c7f3cb53f4251d1578f4772f79831395503fdbf91920c6c1e33cc80281c  app/libs/libbox.aar" | sha256sum --check --strict
    ```
 
 3. Build the APKs:

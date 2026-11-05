@@ -4,12 +4,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 class LocalProxyOptions(
+    val bindAddress: String = SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS,
     val port: Int,
     val authentication: Boolean,
     val username: String,
     val password: String,
 ) {
-    override fun toString() = "LocalProxyOptions(port=$port, authentication=$authentication)"
+    override fun toString() =
+        "LocalProxyOptions(bindAddress=$bindAddress, port=$port, authentication=$authentication)"
 }
 
 class UpstreamProxyOptions(
@@ -24,6 +26,7 @@ class UpstreamProxyOptions(
 }
 
 data class ProxySummary(
+    val localBindAddress: String,
     val localPort: Int,
     val upstreamEnabled: Boolean,
     val upstreamType: SettingsStore.UpstreamProxyType,
@@ -37,6 +40,7 @@ class ProxySettingsRepository(private val store: SettingsStore) {
         withContext(Dispatchers.IO) {
             synchronized(store.proxySettingsLock) {
                 ProxySummary(
+                    store.socksBindAddress,
                     store.socksPort,
                     store.upstreamProxyEnabled,
                     store.upstreamProxyType,
@@ -51,6 +55,7 @@ class ProxySettingsRepository(private val store: SettingsStore) {
         withContext(Dispatchers.IO) {
             synchronized(store.proxySettingsLock) {
                 LocalProxyOptions(
+                    store.socksBindAddress,
                     store.socksPort,
                     store.localProxyAuthEnabled,
                     store.localProxyUsername,

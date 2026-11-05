@@ -9,6 +9,9 @@
     <string name="local_proxy">Local proxy</string>
     <string name="upstream_proxy">Upstream proxy</string>
     <string name="local_proxy_summary">HTTP / SOCKS5 · %1$s:%2$d</string>
+    <string name="local_listen_address">Listen address</string>
+    <string name="local_address_loopback">This device only (Loopback)</string>
+    <string name="local_address_all">All interfaces (Allow LAN devices)</string>
     <string name="local_address_value">Local address: %1$s</string>
     <string name="mixed_port">HTTP / SOCKS5 port</string>
     <string name="local_port_help">The same port supports HTTP and SOCKS5. Controller port %1$d is reserved.</string>
@@ -37,6 +40,7 @@
     <string name="settings_latency_test_url">Latency test URL</string>
     <string name="settings_tunnel_mtu">Tunnel MTU</string>
     <string name="settings_dns_provider">DNS provider</string>
+    <string name="settings_bootstrap_dns_provider">Bootstrap DNS</string>
     <string name="settings_proxy_only_mode">Proxy-only mode</string>
     <string name="settings_proxy_only_help">Run local proxy servers without VPN</string>
     <string name="settings_custom_edge_address">Custom edge address</string>
@@ -44,9 +48,15 @@
     <string name="settings_tls_fragmentation">TLS fragmentation</string>
     <string name="settings_browser_tls_fingerprint">Browser TLS fingerprint</string>
     <string name="settings_multiplex_concurrency">Multiplex concurrency</string>
-    <string name="settings_tcp_fast_open">TCP Fast Open</string>
-    <string name="settings_tcp_fast_open_help">Reduce connection latency on supported networks</string>
-    <string name="settings_ipv6_tunnel">IPv6 tunnel</string>
+    <string name="settings_tcp_only_notice">Inactive (TCP only)</string>
+    <string name="settings_http2_only_notice">HTTP/2 only</string>
+    <string name="settings_ip_mode">IP protocol mode</string>
+    <string name="dialog_ip_mode_help">Select which IP versions to route and the domain lookup strategy.</string>
+    <string name="ip_mode_dual_stack">Dual-Stack</string>
+    <string name="ip_mode_prefer_ipv4">Prefer IPv4</string>
+    <string name="ip_mode_prefer_ipv6">Prefer IPv6</string>
+    <string name="ip_mode_ipv4_only">IPv4 Only</string>
+    <string name="ip_mode_ipv6_only">IPv6 Only</string>
     <string name="settings_tunnel_health">Tunnel health</string>
     <string name="settings_automatic_connection_recovery">Automatic connection recovery</string>
     <string name="settings_recovery_help">Reconnect after repeated confirmed proxy-path failures; stay in the selected country. Applies on next connection.</string>
@@ -56,7 +66,7 @@
     <string name="settings_check_for_updates">Check for updates</string>
     <string name="settings_update_source">Signed releases from GitHub</string>
     <string name="settings_automatic_update_checks">Automatic update checks</string>
-    <string name="settings_automatic_updates_help">Check once a day when the app is opened; installation always needs approval</string>
+    <string name="settings_automatic_updates_help">Check once a day when the app is opened; notifies when a new release is available</string>
     <string name="settings_source_code">Source code</string>
     <string name="settings_sign_out">Sign out</string>
     <string name="settings_doh_url">DoH URL</string>
@@ -118,8 +128,6 @@
         <item quantity="other">%1$d apps</item>
     </plurals>
     <string name="settings_disabled">Disabled</string>
-    <string name="settings_ipv4_only">IPv4 only</string>
-    <string name="settings_dual_stack">Dual-stack IPv4 and IPv6</string>
     <string name="settings_health_not_connected">Not connected</string>
     <string name="settings_health_checking">Checking HTTPS through the proxy</string>
     <string name="settings_health_healthy">HTTPS proxy path is responding</string>
@@ -153,6 +161,7 @@
     <string name="logs_action_clear">Clear logs</string>
 
     <string name="dialog_dns_tunnel_help">DNS server used inside the tunnel.</string>
+    <string name="dialog_dns_bootstrap_help">DNS resolver used outside the tunnel for proxy endpoints, control-plane domains, and remote DoH bootstrapping.</string>
     <string name="dialog_dns_direct_system">Direct via local network</string>
     <string name="dialog_dns_custom_doh">HTTPS DoH endpoint</string>
     <string name="dialog_custom_edge_help">Leave empty to resolve the server hostname normally.</string>
@@ -162,19 +171,16 @@
     <string name="dialog_utls_help">Emulates browser TLS signatures to bypass censorship.</string>
     <string name="dialog_concurrency_help">Maximum concurrent streams per connection.</string>
 
-    <string name="update_dialog_title">App update</string>
-    <string name="update_idle_help">Check for a new signed release.</string>
     <string name="update_checking">Checking for updates…</string>
-    <string name="update_current">No newer compatible update is available.</string>
-    <string name="update_available_msg">Release %1$s is available. Download to verify its version, integrity and signing identity.</string>
-    <string name="update_downloading_fmt">Downloading update: %1$d / %2$d MB</string>
-    <string name="update_ready_msg">Version %1$s is verified and ready. Android will ask you to approve installation. If asked, allow updates from FoxyVPN, return here and tap Install again.</string>
-    <string name="update_btn_download">Download</string>
-    <string name="update_btn_install">Install</string>
-    <string name="update_btn_check">Check</string>
-    <string name="update_btn_check_again">Check again</string>
-    <string name="close">Close</string>
-    <string name="update_installer_failed">Android could not open the installer</string>
+    <string name="update_notification_title">Update available</string>
+    <string name="update_notification_text">FoxyVPN %1$s is available</string>
+    <string name="update_notification_channel_name">App updates</string>
+    <string name="update_notification_channel_desc">Notifications when a newer app release is available</string>
+    <string name="update_btn_view_release">View release</string>
+    <string name="update_dialog_title">Update available</string>
+    <string name="update_dialog_dismiss">Dismiss</string>
+    <string name="update_up_to_date">FoxyVPN is up to date (%1$s)</string>
+    <string name="update_check_failed">Unable to check for updates: %1$s</string>
 
     <string name="proxy_tls_review_error">Review the proxy address before saving the configuration without TLS.</string>
     <string name="proxy_credentials_invalid_error">Enter credentials valid for the selected proxy type, or clear both fields.</string>

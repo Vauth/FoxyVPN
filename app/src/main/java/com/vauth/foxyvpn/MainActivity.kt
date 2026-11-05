@@ -17,7 +17,6 @@ import androidx.navigation.compose.rememberNavController
 import com.vauth.foxyvpn.ui.navigation.FoxyNavGraph
 import com.vauth.foxyvpn.ui.theme.FoxyVpnTheme
 import com.vauth.foxyvpn.ui.theme.rememberThemeController
-import com.vauth.foxyvpn.update.UpdatePrompt
 import com.vauth.foxyvpn.vpn.FoxyVpnService
 
 class MainActivity : ComponentActivity() {
@@ -80,7 +79,6 @@ class MainActivity : ComponentActivity() {
             FoxyVpnTheme(themeMode = themeController.mode) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val navController = rememberNavController()
-                    UpdatePrompt(app.appUpdater)
                     FoxyNavGraph(
                         navController = navController,
                         container = app,

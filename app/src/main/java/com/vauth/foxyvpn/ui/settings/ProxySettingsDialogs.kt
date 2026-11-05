@@ -98,23 +98,61 @@ private fun LocalProxyDialog(
     onDismiss: () -> Unit,
     onSave: (LocalProxyOptions) -> Unit,
 ) {
+    var bindAddress by remember(initial) { mutableStateOf(initial.bindAddress) }
     var port by remember(initial) { mutableStateOf(initial.port.toString()) }
-
     var authentication by remember(initial) { mutableStateOf(initial.authentication) }
     var username by remember(initial) { mutableStateOf(initial.username) }
     var password by remember(initial) { mutableStateOf(initial.password) }
     val validPort = SettingsStore.isValidLocalPort(port.toIntOrNull() ?: 0)
     val validCredentials =
         !authentication || SettingsStore.isValidLocalProxyCredentials(username, password)
+    val validAddress =
+        bindAddress == SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS ||
+            bindAddress == SettingsStore.ALL_INTERFACES_BIND_ADDRESS
     ProxyEditorDialog(
         stringResource(R.string.local_proxy),
         busy,
         error,
-        validPort && validCredentials,
+        validPort && validCredentials && validAddress,
         onDismiss,
-        { onSave(LocalProxyOptions(port.toInt(), authentication, username, password)) },
+        { onSave(LocalProxyOptions(bindAddress, port.toInt(), authentication, username, password)) },
     ) {
-        Text(stringResource(R.string.local_address_value, SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS))
+        Text(
+            stringResource(R.string.local_listen_address),
+            style = MaterialTheme.typography.labelLarge,
+        )
+        Column(Modifier.selectableGroup()) {
+            listOf(
+                SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS to R.string.local_address_loopback,
+                SettingsStore.ALL_INTERFACES_BIND_ADDRESS to R.string.local_address_all,
+            ).forEach { (address, descRes) ->
+                Row(
+                    Modifier.fillMaxWidth()
+                        .selectable(
+                            selected = bindAddress == address,
+                            enabled = !busy,
+                            role = Role.RadioButton,
+                            onClick = { bindAddress = address },
+                        )
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(
+                        selected = bindAddress == address,
+                        onClick = null,
+                        enabled = !busy,
+                    )
+                    Column(Modifier.padding(start = 8.dp)) {
+                        Text(address, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            stringResource(descRes),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
         PortField(port, { port = it }, stringResource(R.string.mixed_port), !busy, !validPort)
         Text(
             stringResource(R.string.local_port_help, SettingsStore.CONTROLLER_PORT),

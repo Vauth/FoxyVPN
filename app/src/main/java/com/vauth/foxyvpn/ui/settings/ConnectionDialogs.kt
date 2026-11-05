@@ -46,6 +46,8 @@ private val NetworkDraftSaver =
 
 @Composable
 internal fun DnsProviderPickerDialog(
+    title: String = stringResource(R.string.settings_dns_provider),
+    helpText: String = stringResource(R.string.dialog_dns_tunnel_help),
     currentProvider: SettingsStore.DnsProvider,
     currentCustomUrl: String,
     onDismiss: () -> Unit,
@@ -60,11 +62,11 @@ internal fun DnsProviderPickerDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.settings_dns_provider)) },
+        title = { Text(title) },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()).selectableGroup()) {
                 Text(
-                    stringResource(R.string.dialog_dns_tunnel_help),
+                    helpText,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 8.dp),
@@ -220,6 +222,63 @@ internal fun HttpVersionPickerDialog(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(selected) }) { Text(stringResource(R.string.save)) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+@Composable
+internal fun IpModePickerDialog(
+    current: SettingsStore.IpMode,
+    onDismiss: () -> Unit,
+    onConfirm: (SettingsStore.IpMode) -> Unit,
+) {
+    var selected by rememberSaveable { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.settings_ip_mode)) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()).selectableGroup()) {
+                Text(
+                    stringResource(R.string.dialog_ip_mode_help),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 12.dp),
+                )
+                SettingsStore.IpMode.entries.forEach { mode ->
+                    val label =
+                        when (mode) {
+                            SettingsStore.IpMode.DUAL_STACK -> stringResource(R.string.ip_mode_dual_stack)
+                            SettingsStore.IpMode.PREFER_IPV4 -> stringResource(R.string.ip_mode_prefer_ipv4)
+                            SettingsStore.IpMode.PREFER_IPV6 -> stringResource(R.string.ip_mode_prefer_ipv6)
+                            SettingsStore.IpMode.IPV4_ONLY -> stringResource(R.string.ip_mode_ipv4_only)
+                            SettingsStore.IpMode.IPV6_ONLY -> stringResource(R.string.ip_mode_ipv6_only)
+                        }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier =
+                            Modifier.fillMaxWidth()
+                                .selectable(
+                                    selected = selected == mode,
+                                    role = Role.RadioButton,
+                                    onClick = { selected = mode },
+                                )
+                                .heightIn(min = 48.dp)
+                                .padding(vertical = 4.dp),
+                    ) {
+                        RadioButton(selected = selected == mode, onClick = null)
+                        Text(
+                            text = label,
+                            modifier = Modifier.padding(start = 8.dp),
+                        )
                     }
                 }
             }

@@ -18,12 +18,16 @@ object SingBoxConfigBuilder {
                 }
             )
 
-    private val localNetworkAddresses =
+    private val localNetworkAddressesIpv4 =
         listOf(
             "10.0.0.0/8",
             "172.16.0.0/12",
             "192.168.0.0/16",
             "169.254.0.0/16",
+        )
+
+    private val localNetworkAddressesIpv6 =
+        listOf(
             "fc00::/7",
             "fe80::/10",
         )
@@ -78,7 +82,14 @@ object SingBoxConfigBuilder {
         ) {
             "Upstream proxy must not point to a FoxyVPN listener"
         }
-        require(!settings.ipv6Enabled || settings.mtu >= 1280) {
+        require(
+            !settings.upstreamProxyEnabled ||
+                settings.upstreamProxyType != SettingsStore.UpstreamProxyType.HTTP ||
+                settings.httpVersion != SettingsStore.HttpVersion.HTTP_3
+        ) {
+            "HTTP/3 (QUIC) is not supported over an upstream HTTP proxy"
+        }
+        require(!settings.ipMode.hasIpv6 || settings.mtu >= 1280) {
             "IPv6 requires a tunnel MTU of at least 1280"
         }
         require(
@@ -97,10 +108,17 @@ object SingBoxConfigBuilder {
             "Local proxy credentials require 1–255 UTF-8 bytes each and no colon in the username"
         }
         require(controllerSecret.isNotBlank()) { "Controller authentication is required" }
-        require(settings.socksBindAddress == "127.0.0.1") {
-            "Unauthenticated LAN proxy listeners are disabled"
+        require(
+            settings.socksBindAddress == SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS ||
+                settings.socksBindAddress == SettingsStore.ALL_INTERFACES_BIND_ADDRESS,
+        ) {
+            "Local proxy listen address must be ${SettingsStore.DEFAULT_SOCKS_BIND_ADDRESS} or ${SettingsStore.ALL_INTERFACES_BIND_ADDRESS}"
         }
         require(bearerToken.isNotBlank()) { "A proxy pass is required" }
+        val localNetworkAddresses = buildList {
+            if (settings.ipMode.hasIpv4) addAll(localNetworkAddressesIpv4)
+            if (settings.ipMode.hasIpv6) addAll(localNetworkAddressesIpv6)
+        }
         val root = JSONObject()
 
         val log =
@@ -122,6 +140,37 @@ object SingBoxConfigBuilder {
                 put("tag", "local-dns")
             }
         )
+
+        val hasBootstrapDns =
+            settings.bootstrapDnsProvider != SettingsStore.DnsProvider.DIRECT_SYSTEM &&
+                settings.effectiveBootstrapDohUrl.isNotBlank()
+        val bootstrapDnsTag = "bootstrap-dns"
+
+        if (hasBootstrapDns) {
+            val bootstrapDohUri = URI(settings.effectiveBootstrapDohUrl)
+            val bootstrapDnsServer = bootstrapDohUri.host.removeSurrounding("[", "]")
+            val bootstrapDnsPath = bootstrapDohUri.rawPath.takeIf { it.isNotBlank() }
+            val bootstrapDnsPort = bootstrapDohUri.port.takeIf { it > 0 }
+
+            dnsServers.put(
+                JSONObject().apply {
+                    put("type", "https")
+                    put("tag", bootstrapDnsTag)
+                    put("server", bootstrapDnsServer)
+                    if (bootstrapDnsPort != null && bootstrapDnsPort != 443) {
+                        put("server_port", bootstrapDnsPort)
+                    }
+                    if (bootstrapDnsPath != null && bootstrapDnsPath != "/dns-query") {
+                        put("path", bootstrapDnsPath)
+                    }
+                    if (bootstrapDnsServer.any { it.isLetter() }) {
+                        put("domain_resolver", "local-dns")
+                    }
+                }
+            )
+        }
+
+        val activeBootstrapDnsTag = if (hasBootstrapDns) bootstrapDnsTag else "local-dns"
 
         val finalDnsTag: String =
             when (settings.dnsProvider) {
@@ -146,7 +195,7 @@ object SingBoxConfigBuilder {
                                 put("path", remoteDnsPath)
                             }
                             if (remoteDnsServer.any { it.isLetter() }) {
-                                put("domain_resolver", "local-dns")
+                                put("domain_resolver", activeBootstrapDnsTag)
                             }
                             put("detour", "proxy-out")
                         }
@@ -157,7 +206,9 @@ object SingBoxConfigBuilder {
 
         dns.put("servers", dnsServers)
         dns.put("final", finalDnsTag)
-        dns.put("strategy", if (settings.ipv6Enabled) "prefer_ipv4" else "ipv4_only")
+        settings.ipMode.dnsStrategy?.let {
+            dns.put("strategy", it)
+        }
         dns.put("disable_cache", false)
         root.put("dns", dns)
 
@@ -189,7 +240,8 @@ object SingBoxConfigBuilder {
         val inbounds = JSONArray()
 
         if (!settings.proxyOnlyMode) {
-            val hasTunIpv6 = settings.ipv6Enabled || settings.mtu >= 1280
+            val hasTunIpv4 = settings.ipMode.hasIpv4
+            val hasTunIpv6 = settings.ipMode.hasIpv6
             val tunInbound =
                 JSONObject().apply {
                     put("type", "tun")
@@ -198,7 +250,9 @@ object SingBoxConfigBuilder {
                     put(
                         "address",
                         JSONArray().apply {
-                            put(DEFAULT_TUN_IPV4)
+                            if (hasTunIpv4) {
+                                put(DEFAULT_TUN_IPV4)
+                            }
                             if (hasTunIpv6) {
                                 put(DEFAULT_TUN_IPV6)
                             }
@@ -207,7 +261,9 @@ object SingBoxConfigBuilder {
                     put(
                         "dns_address",
                         JSONArray().apply {
-                            put(DEFAULT_TUN_DNS_IPV4)
+                            if (hasTunIpv4) {
+                                put(DEFAULT_TUN_DNS_IPV4)
+                            }
                             if (hasTunIpv6) {
                                 put(DEFAULT_TUN_DNS_IPV6)
                             }
@@ -215,7 +271,7 @@ object SingBoxConfigBuilder {
                     )
                     put("auto_route", true)
                     put("strict_route", true)
-                    if (settings.bypassLocalNetwork) {
+                    if (settings.bypassLocalNetwork && localNetworkAddresses.isNotEmpty()) {
                         put("route_exclude_address", JSONArray(localNetworkAddresses))
                     }
                     if (settings.splitTunnelMode == SettingsStore.SplitTunnelMode.INCLUDE) {
@@ -248,6 +304,7 @@ object SingBoxConfigBuilder {
                 put("tag", "mixed-in")
                 put("listen", settings.socksBindAddress)
                 put("listen_port", settings.socksPort)
+                put("reuse_addr", true)
                 if (settings.localProxyAuthEnabled) put("users", proxyUsers(settings))
             }
         inbounds.put(mixedInbound)
@@ -280,53 +337,50 @@ object SingBoxConfigBuilder {
                     put("tag", tag)
                     put("server", serverAddress)
                     put("server_port", candidate.port)
-                    put("domain_resolver", "local-dns")
-                    if (settings.tcpFastOpen) {
-                        put("tcp_fast_open", true)
-                    }
+                    put("domain_resolver", activeBootstrapDnsTag)
                     put("dynamic_bearer_token", true)
                     put("version", targetVersion)
+                    put("disable_version_fallback", true)
                     if (targetVersion == 2) {
                         put("max_concurrent_streams", settings.maxConcurrentStreams)
-                        put("disable_version_fallback", true)
                         put("stream_receive_window", "16 MB")
                         put("connection_receive_window", "32 MB")
                         put("idle_timeout", "30s")
                         put("keep_alive_period", "15s")
-                    } else {
-                        put("disable_version_fallback", false)
                     }
 
                     val tls =
                         JSONObject().apply {
                             put("enabled", true)
                             put("server_name", candidate.host)
-                            put(
-                                "utls",
-                                JSONObject().apply {
-                                    put("enabled", true)
-                                    put("fingerprint", settings.utlsFingerprint.identifier)
-                                },
-                            )
-                            when (settings.tlsFragmentMode) {
-                                SettingsStore.TlsFragmentMode.OFF -> {}
-                                SettingsStore.TlsFragmentMode.RECORD -> {
-                                    put("record_fragment", true)
-                                }
-                                SettingsStore.TlsFragmentMode.PACKET -> {
-                                    put("fragment", true)
-                                    put(
-                                        "fragment_fallback_delay",
-                                        "${settings.fragmentFallbackDelay}ms",
-                                    )
-                                }
-                                SettingsStore.TlsFragmentMode.COMBINED -> {
-                                    put("fragment", true)
-                                    put("record_fragment", true)
-                                    put(
-                                        "fragment_fallback_delay",
-                                        "${settings.fragmentFallbackDelay}ms",
-                                    )
+                            if (targetVersion != 3) {
+                                put(
+                                    "utls",
+                                    JSONObject().apply {
+                                        put("enabled", true)
+                                        put("fingerprint", settings.utlsFingerprint.identifier)
+                                    },
+                                )
+                                when (settings.tlsFragmentMode) {
+                                    SettingsStore.TlsFragmentMode.OFF -> {}
+                                    SettingsStore.TlsFragmentMode.RECORD -> {
+                                        put("record_fragment", true)
+                                    }
+                                    SettingsStore.TlsFragmentMode.PACKET -> {
+                                        put("fragment", true)
+                                        put(
+                                            "fragment_fallback_delay",
+                                            "${settings.fragmentFallbackDelay}ms",
+                                        )
+                                    }
+                                    SettingsStore.TlsFragmentMode.COMBINED -> {
+                                        put("fragment", true)
+                                        put("record_fragment", true)
+                                        put(
+                                            "fragment_fallback_delay",
+                                            "${settings.fragmentFallbackDelay}ms",
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -356,7 +410,7 @@ object SingBoxConfigBuilder {
                     put("tag", "upstream-detour")
                     put("server", settings.upstreamProxyHost)
                     put("server_port", settings.upstreamProxyPort)
-                    put("domain_resolver", "local-dns")
+                    put("domain_resolver", activeBootstrapDnsTag)
                     if (settings.upstreamProxyType == SettingsStore.UpstreamProxyType.SOCKS5)
                         put("version", "5")
                     if (settings.upstreamProxyUsername.isNotEmpty()) {
@@ -392,7 +446,7 @@ object SingBoxConfigBuilder {
                                 put("action", "reject")
                             }
                         )
-                        if (settings.bypassLocalNetwork) {
+                        if (settings.bypassLocalNetwork && localNetworkAddresses.isNotEmpty()) {
                             put(
                                 JSONObject().apply {
                                     put("ip_cidr", JSONArray(localNetworkAddresses))
@@ -400,7 +454,7 @@ object SingBoxConfigBuilder {
                                 }
                             )
                         }
-                        if (!settings.ipv6Enabled) {
+                        if (!settings.ipMode.hasIpv6) {
                             put(
                                 JSONObject().apply {
                                     put("ip_version", 6)
@@ -408,13 +462,50 @@ object SingBoxConfigBuilder {
                                 }
                             )
                         }
+                        if (!settings.ipMode.hasIpv4) {
+                            put(
+                                JSONObject().apply {
+                                    put("ip_version", 4)
+                                    put("action", "reject")
+                                }
+                            )
+                        }
+                        put(
+                            JSONObject().apply {
+                                put(
+                                    "domain",
+                                    JSONArray().apply {
+                                        put("mtalk.google.com")
+                                        for (i in 1..8) {
+                                            put("alt$i-mtalk.google.com")
+                                        }
+                                    },
+                                )
+                                put("override_port", 443)
+                                put("outbound", "proxy-out")
+                            }
+                        )
+                        put(
+                            JSONObject().apply {
+                                put(
+                                    "port",
+                                    JSONArray().apply {
+                                        put(5228)
+                                        put(5229)
+                                        put(5230)
+                                    },
+                                )
+                                put("override_port", 443)
+                                put("outbound", "proxy-out")
+                            }
+                        )
                         put(JSONObject().apply { put("outbound", "proxy-out") })
                     },
                 )
                 put("final", "proxy-out")
                 put("auto_detect_interface", true)
                 put("find_process", false)
-                put("default_domain_resolver", "local-dns")
+                put("default_domain_resolver", activeBootstrapDnsTag)
                 put("default_http_client", "default-http-client")
             }
         root.put("route", route)
