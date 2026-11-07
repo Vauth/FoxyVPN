@@ -12,20 +12,17 @@ import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 
 class FastlyChallengeError(message: String) : Exception(message)
 
 private const val SOLVE_TIMEOUT_SECONDS = 60L
 
 private const val MAX_POST_BACK_ROUNDS = 8
-
-private const val SOLVER_USER_AGENT =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
 private const val POW_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -43,7 +40,7 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
     suspend fun solveAndInstall(
         challengedBody: String? = null,
         challengedOrigin: String? = null,
-        userAgent: String = SOLVER_USER_AGENT,
+        userAgent: String = FirefoxAccountHeaders.controlPlaneUserAgent,
     ) =
         withTimeout(90_000L) {
             solverMutex.withLock {
@@ -65,47 +62,30 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                     ) {
                         "Untrusted challenge origin"
                     }
-                    cookieJar.syncFromWebView()
                     val base = "https://${origin.host}"
                     if (!challengedBody.isNullOrEmpty() && isChallengePage(challengedBody)) {
-                        solveChallengePage(challengedBody, base, userAgent)
+                        val solverJar = SimpleCookieJar()
+                        val solver = newSolverClient(solverJar)
+                        solveChallengePage(challengedBody, base, userAgent, solver, solverJar)
                         return@withContext
                     }
                     val bases =
                         listOf(
                             base,
-                            "https://accounts.firefox.com",
                             "https://api.accounts.firefox.com",
+                            "https://accounts.firefox.com",
                         ).distinct()
-                    val candidateUrls =
-                        bases.flatMap { baseHost ->
-                            if (baseHost.contains("accounts.firefox.com") && !baseHost.contains("api.")) {
-                                listOf("$baseHost/", "$baseHost/?context=fx_desktop_v3&service=sync&action=email")
-                            } else {
-                                listOf("$baseHost/")
-                            }
-                        }
                     var lastError: FastlyChallengeError? = null
-                    for (candidateUrl in candidateUrls) {
-                        val candidateBase =
-                            if (candidateUrl.contains('?')) candidateUrl.substringBefore('?').trimEnd('/')
-                            else candidateUrl.trimEnd('/')
-                        for (candidateUA in listOf(userAgent, SOLVER_USER_AGENT, FirefoxAccountHeaders.userAgent).distinct()) {
+                    for (candidateBase in bases) {
+                        for (candidateUA in listOf(userAgent, FirefoxAccountHeaders.browserUserAgent, FirefoxAccountHeaders.desktopUserAgent).distinct()) {
                             try {
-                                val page =
-                                    fetchText(
-                                        newSolverClient(SimpleCookieJar()),
-                                        candidateUrl,
-                                        userAgent = candidateUA,
-                                        allowChallenge = true,
-                                    )
-                                if (!isChallengePage(page)) continue
-                                solveChallengePage(page, candidateBase, candidateUA)
-                                return@withContext
+                                if (solveChallengeOnHost(candidateBase, candidateUA)) {
+                                    return@withContext
+                                }
                             } catch (error: FastlyChallengeError) {
                                 lastError = error
                             } catch (e: Exception) {
-                                lastError = FastlyChallengeError("Error probing $candidateUrl: ${e.message}")
+                                lastError = FastlyChallengeError("Error probing $candidateBase: ${e.message}")
                             }
                         }
                     }
@@ -143,12 +123,15 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         client: OkHttpClient,
         url: String,
         accept: String = HTML_ACCEPT,
-        userAgent: String = SOLVER_USER_AGENT,
+        userAgent: String = FirefoxAccountHeaders.controlPlaneUserAgent,
         allowChallenge: Boolean = false,
     ): String {
+        val builder = Request.Builder().url(url)
+        for ((key, value) in FoxyRemoteConfig.current.solver.headers) {
+            builder.header(key, value)
+        }
         val request =
-            Request.Builder()
-                .url(url)
+            builder
                 .header("User-Agent", userAgent)
                 .header("Accept", accept)
                 .build()
@@ -167,69 +150,44 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                 text.contains("script.js") ||
                 text.contains("fst-post-back"))
 
-    private fun parseChallengeInit(script: String): Pair<JSONArray, String> {
-        for (match in INIT_CALL_REGEX.findAll(script).toList().asReversed()) {
+    private fun parseChallengeInit(script: String, prefix: String = ""): Pair<JSONArray, String> {
+        val matches = INIT_CALL_REGEX.findAll(script).toList().asReversed()
+        var legacyResult: Pair<JSONArray, String>? = null
+
+        for (match in matches) {
             val start = match.range.last
-            var depth = 0
-            var quoted = false
-            var escaped = false
-            for (index in start until script.length) {
-                val char = script[index]
-                if (quoted) {
-                    when {
-                        escaped -> escaped = false
-                        char == '\\' -> escaped = true
-                        char == '"' -> quoted = false
+            val tokener = JSONTokener(script.substring(start))
+            val challenges = runCatching { tokener.nextValue() as? JSONArray }.getOrNull()
+            if (challenges == null || challenges.length() == 0 || challenges.length() > 16) continue
+            if (tokener.nextClean() != ',') continue
+            val token = runCatching { tokener.nextValue() as? String }.getOrNull()
+            if (token.isNullOrBlank()) continue
+
+            val delim = tokener.nextClean()
+            if (delim == ',') {
+                val scriptPrefix = runCatching { tokener.nextValue() as? String }.getOrNull()
+                val nextDelim = tokener.nextClean()
+                val hasValidDelimiter = nextDelim == ')' || nextDelim == ','
+                if (hasValidDelimiter && (prefix.isEmpty() || scriptPrefix == prefix)) {
+                    val valid = (0 until challenges.length()).all {
+                        val item = challenges.optJSONObject(it)
+                        item != null && item.optString("ty").isNotBlank()
                     }
-                    continue
+                    if (valid) return challenges to token
                 }
-                when (char) {
-                    '"' -> quoted = true
-                    '[' -> depth++
-                    ']' -> {
-                        depth--
-                        if (depth != 0) continue
-                        val tail = script.substring(index + 1).trimStart()
-                        if (!tail.startsWith(",")) break
-                        val args = tail.drop(1).trimStart()
-                        if (!args.startsWith('"')) break
-                        var end = 1
-                        var escape = false
-                        while (end < args.length) {
-                            val next = args[end]
-                            if (!escape && next == '"') break
-                            escape = !escape && next == '\\'
-                            end++
-                        }
-                        if (
-                            end >= args.length ||
-                                !args.substring(end + 1).trimStart().startsWith(",")
-                        )
-                            break
-                        try {
-                            val challenges = JSONArray(script.substring(start, index + 1))
-                            val token =
-                                JSONArray("[" + args.substring(0, end + 1) + "]").getString(0)
-                            if (
-                                challenges.length() > 0 &&
-                                    challenges.length() <= 16 &&
-                                    token.isNotBlank() &&
-                                    (0 until challenges.length()).all {
-                                        val item = challenges.optJSONObject(it)
-                                        item != null &&
-                                            item.opt("ty") is String &&
-                                            item.getString("ty").isNotBlank()
-                                    }
-                            )
-                                return challenges to token
-                        } catch (_: org.json.JSONException) {
-                            break
-                        }
-                        break
-                    }
+            } else if (delim == ')') {
+                val valid = (0 until challenges.length()).all {
+                    val item = challenges.optJSONObject(it)
+                    item != null && item.optString("ty").isNotBlank()
+                }
+                if (valid && legacyResult == null) {
+                    legacyResult = challenges to token
                 }
             }
         }
+
+        if (legacyResult != null) return legacyResult
+
         throw FastlyChallengeError("Could not read the Fastly challenge")
     }
 
@@ -240,9 +198,12 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         userAgent: String,
     ): String {
         val patUrl = "$prefixUrl/pat?token=${URLEncoder.encode(token, "UTF-8")}"
+        val builder = Request.Builder().url(patUrl)
+        for ((key, value) in FoxyRemoteConfig.current.solver.headers) {
+            builder.header(key, value)
+        }
         val request =
-            Request.Builder()
-                .url(patUrl)
+            builder
                 .header("Accept", "text/plain")
                 .header("Content-Type", "application/json")
                 .header("User-Agent", userAgent)
@@ -402,7 +363,6 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
     private fun newSolverClient(solverJar: SimpleCookieJar): OkHttpClient =
         ControlPlaneHttp.client
             .newBuilder()
-            .protocols(listOf(Protocol.HTTP_1_1))
             .cookieJar(solverJar)
             .followRedirects(false)
             .followSslRedirects(false)
@@ -410,9 +370,31 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
             .readTimeout(SOLVE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .build()
 
-    private suspend fun solveChallengePage(page: String, base: String, userAgent: String) {
+    private suspend fun solveChallengeOnHost(base: String, userAgent: String): Boolean {
         val solverJar = SimpleCookieJar()
         val solver = newSolverClient(solverJar)
+        val pageUrl = "$base/"
+
+        val page =
+            try {
+                fetchText(solver, pageUrl, userAgent = userAgent, allowChallenge = true)
+            } catch (_: Exception) {
+                return false
+            }
+        if (!isChallengePage(page)) {
+            return false
+        }
+        solveChallengePage(page, base, userAgent, solver, solverJar)
+        return true
+    }
+
+    private suspend fun solveChallengePage(
+        page: String,
+        base: String,
+        userAgent: String,
+        solver: OkHttpClient,
+        solverJar: SimpleCookieJar,
+    ) {
         val pageUrl = "$base/"
 
         val prefixMatch =
@@ -421,7 +403,7 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         val prefixUrl = base + prefixMatch.value
 
         val script = fetchText(solver, "$prefixUrl/script.js?reload=true", userAgent = userAgent)
-        var (challenges, token) = parseChallengeInit(script)
+        var (challenges, token) = parseChallengeInit(script, prefixMatch.value)
 
         repeat(MAX_POST_BACK_ROUNDS) {
             val answers = JSONArray()
@@ -444,9 +426,12 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                     }
                     .toString()
                     .toRequestBody("application/json".toMediaType())
+            val builder = Request.Builder().url("$prefixUrl/fst-post-back")
+            for ((key, value) in FoxyRemoteConfig.current.solver.headers) {
+                builder.header(key, value)
+            }
             val request =
-                Request.Builder()
-                    .url("$prefixUrl/fst-post-back")
+                builder
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
                     .header("User-Agent", userAgent)

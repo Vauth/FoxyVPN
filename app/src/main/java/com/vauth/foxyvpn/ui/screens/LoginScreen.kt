@@ -47,9 +47,7 @@ fun LoginScreen(authRepository: FxaAuthRepository, onSignedIn: () -> Unit) {
         BrowserLoginScreen(
             startUrl = browserStartUrl,
             busy = completingBrowserLogin,
-            authRepository = authRepository,
             errorMessage = errorMessage,
-            onTokensCaptured = model::completeBrowserLoginWithTokens,
             onSessionCaptured = model::completeBrowserLogin,
             onCanceled = model::cancelVerification,
         )

@@ -3,7 +3,6 @@ package com.vauth.foxyvpn.ui.screens
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -41,8 +40,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.vauth.foxyvpn.R
 import com.vauth.foxyvpn.data.AppLogger
-import com.vauth.foxyvpn.data.ControlPlaneHttp
-import com.vauth.foxyvpn.data.FxaAuthRepository
+import com.vauth.foxyvpn.data.FirefoxAccountHeaders
 import java.lang.ref.WeakReference
 import org.json.JSONObject
 
@@ -55,194 +53,46 @@ private const val CMD_LOGIN = "fxaccounts:login"
 
 private val SESSION_TOKEN_HEX = Regex("^[0-9a-f]{64}$")
 
-private val FIREFOX_ANDROID_UA =
-    "Mozilla/5.0 (Android ${Build.VERSION.RELEASE.ifBlank { "14" }}; Mobile; rv:135.0) Gecko/135.0 Firefox/135.0"
-
 private fun jsString(value: String): String = JSONObject.quote(value)
 
 private val WEBCHANNEL_HOOK_JS = """
 (function() {
   if (window.__foxyChannelHooked) return;
   window.__foxyChannelHooked = true;
-  var forward = function (detail) {
+  var send = function(o) {
     try {
       var host = window.location.hostname;
       if (host !== 'accounts.firefox.com' && !host.endsWith('.firefox.com')) return;
-      var payload = typeof detail === 'string' ? detail : JSON.stringify(detail);
+      var payload = typeof o === 'string' ? o : JSON.stringify(o);
       foxyWebChannel.onMessage(payload, window.location.href);
     } catch (e) {}
   };
-  window.addEventListener('WebChannelMessageToChrome', function (e) { forward(e.detail); });
-  document.addEventListener('WebChannelMessageToChrome', function (e) { forward(e.detail); });
-  window.__foxyReply = function (channelId, messageId, command, dataJson) {
-    try {
-      var parsedData = typeof dataJson === 'string' ? JSON.parse(dataJson) : dataJson;
-      var envelope = {
-        id: channelId,
-        message: { messageId: messageId, command: command, data: parsedData }
-      };
-      var eventObj = new CustomEvent('WebChannelMessageToContent', { detail: envelope });
-      window.dispatchEvent(eventObj);
-      document.dispatchEvent(eventObj);
-      var eventStr = new CustomEvent('WebChannelMessageToContent', { detail: JSON.stringify(envelope) });
-      window.dispatchEvent(eventStr);
-      document.dispatchEvent(eventStr);
-    } catch (e) {}
+  var onChannel = function(e) {
+    var d = e.detail;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return; } }
+    if (d && d.message) send(d);
   };
-  var getUrlString = function(arg) {
-    if (!arg) return '';
-    if (typeof arg === 'string') return arg;
-    if (typeof arg.url === 'string') return arg.url;
-    if (typeof arg.href === 'string') return arg.href;
-    try { return arg.toString(); } catch (e) { return ''; }
+  window.addEventListener('WebChannelMessageToChrome', onChannel);
+  document.addEventListener('WebChannelMessageToChrome', onChannel);
+  window.__foxyReply = function(id, messageId, command, data) {
+    var detail = { id: id, message: { messageId: messageId, command: command, data: data } };
+    window.dispatchEvent(new CustomEvent('WebChannelMessageToContent', { detail: detail }));
+    document.dispatchEvent(new CustomEvent('WebChannelMessageToContent', { detail: detail }));
   };
-  var checkVerifyUrl = function(url) {
-    var u = getUrlString(url).toLowerCase();
-    return u.indexOf('/verify') !== -1 || u.indexOf('/totp') !== -1 || u.indexOf('/session/verify') !== -1 ||
-           u.indexOf('enter_code') !== -1 || u.indexOf('confirm_signin') !== -1 || u.indexOf('confirm_email') !== -1;
-  };
-  var checkSuccessUrl = function(url) {
-    var u = getUrlString(url).toLowerCase();
-    return u.indexOf('confirmed') !== -1 || u.indexOf('connect_another_device') !== -1 ||
-           u.indexOf('/pair') !== -1 || u.indexOf('/settings') !== -1 || u.indexOf('/complete') !== -1 ||
-           u.indexOf('/verified') !== -1 || u.indexOf('success') !== -1;
-  };
-  if (window.fetch) {
-    var origFetch = window.fetch;
-    window.fetch = function() {
-      var reqUrl = (arguments[0] && arguments[0].url) || arguments[0] || '';
-      return origFetch.apply(this, arguments).then(function(res) {
-        try {
-          if (res && res.ok && checkVerifyUrl(reqUrl)) {
-            foxyWebChannel.onSessionVerified();
-          }
-        } catch (e) {}
-        return res;
-      });
-    };
-  }
-  if (window.XMLHttpRequest) {
-    var origOpen = XMLHttpRequest.prototype.open;
-    var origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url) {
-      this.__foxyReqUrl = url;
-      return origOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.send = function() {
-      this.addEventListener('load', function() {
-        try {
-          if (this.status >= 200 && this.status < 300 && checkVerifyUrl(this.__foxyReqUrl)) {
-            foxyWebChannel.onSessionVerified();
-          }
-        } catch (e) {}
-      });
-      return origSend.apply(this, arguments);
-    };
-  }
-  var notifyNav = function() {
-    try {
-      if (checkSuccessUrl(window.location.href)) {
-        foxyWebChannel.onSessionVerified();
-      }
-    } catch (e) {}
-  };
-  var origPushState = history.pushState;
-  if (origPushState) {
-    history.pushState = function() {
-      var ret = origPushState.apply(this, arguments);
-      notifyNav();
-      return ret;
-    };
-  }
-  var origReplaceState = history.replaceState;
-  if (origReplaceState) {
-    history.replaceState = function() {
-      var ret = origReplaceState.apply(this, arguments);
-      notifyNav();
-      return ret;
-    };
-  }
-  window.addEventListener('popstate', notifyNav);
-  window.addEventListener('hashchange', notifyNav);
 })();
 """.trimIndent()
 
 internal class WebChannelBridge(
     webView: WebView,
-    private val authRepository: FxaAuthRepository,
-    private val onTokens: (String, String?, Long) -> Unit,
     private val onSessionToken: (String) -> Unit,
 ) {
     private val webViewRef = WeakReference(webView)
     @Volatile
-    var pendingSessionToken: String? = null
-        private set
-    @Volatile
-    private var exchangeInProgress = false
+    private var lastSessionToken: String? = null
 
     @JavascriptInterface
     fun onMessage(payload: String) {
         onMessage(payload, "https://accounts.firefox.com")
-    }
-
-    @JavascriptInterface
-    fun onSessionVerified() {
-        val token = pendingSessionToken ?: return
-        exchangeInProgress = false
-        notifySessionToken(token)
-    }
-
-    @JavascriptInterface
-    fun onOAuthResult(status: Int, responseText: String) {
-        val token = pendingSessionToken
-        if (status in 200..299) {
-            val parsed = runCatching {
-                val json = JSONObject(responseText)
-                val accessToken = json.getString("access_token")
-                val refreshToken = json.optString("refresh_token").ifBlank { null }
-                val expiresIn = json.optLong("expires_in", 0L)
-                Triple(accessToken, refreshToken, expiresIn)
-            }.getOrNull()
-            if (parsed != null) {
-                val view = webViewRef.get()
-                if (view != null) {
-                    view.post { onTokens(parsed.first, parsed.second, parsed.third) }
-                } else {
-                    onTokens(parsed.first, parsed.second, parsed.third)
-                }
-                return
-            }
-        }
-        val isUnconfirmed = status == 400 &&
-            (responseText.contains("104") ||
-                responseText.contains("Unconfirmed session", ignoreCase = true) ||
-                responseText.contains("unverified", ignoreCase = true))
-        if (isUnconfirmed) {
-            exchangeInProgress = false
-            return
-        }
-        if (token != null) {
-            fallbackSession(token)
-        }
-    }
-
-    @JavascriptInterface
-    fun onOAuthError(error: String) {
-        AppLogger.w(TAG, "in-browser oauth exchange failed: $error")
-        val token = pendingSessionToken
-        if (token != null) {
-            fallbackSession(token)
-        }
-    }
-
-    private fun fallbackSession(token: String) {
-        exchangeInProgress = false
-        val view = webViewRef.get()
-        if (view != null) {
-            view.post { onSessionToken(token) }
-        } else {
-            onSessionToken(token)
-        }
     }
 
     @JavascriptInterface
@@ -251,20 +101,24 @@ internal class WebChannelBridge(
         if (host != "accounts.firefox.com" && host?.endsWith(".firefox.com") != true) {
             return
         }
-        val message = runCatching {
-            JSONObject(payload).optJSONObject("message") ?: JSONObject()
+        val envelope = runCatching {
+            JSONObject(payload)
         }.getOrNull() ?: return
+        val channelId = envelope.optString("id").ifBlank { FXA_CHANNEL_ID }
+        val message = envelope.optJSONObject("message") ?: JSONObject()
         val command = message.optString("command")
         val data = message.optJSONObject("data") ?: JSONObject()
         val messageId = message.optString("messageId")
 
         when (command) {
             CMD_FXA_STATUS -> reply(
+                channelId,
                 messageId,
                 CMD_FXA_STATUS,
                 """{"capabilities":{},"signedInUser":null}""",
             )
             CMD_CAN_LINK_ACCOUNT -> reply(
+                channelId,
                 messageId,
                 CMD_CAN_LINK_ACCOUNT,
                 """{"ok":true}""",
@@ -273,86 +127,38 @@ internal class WebChannelBridge(
                 val token = data.optString("sessionToken", "").trim()
                     .ifBlank { data.optString("token", "").trim() }
                 if (SESSION_TOKEN_HEX.matches(token)) {
-                    pendingSessionToken = token
-                    val hasVerificationReason = data.has("verificationReason") &&
-                        data.optString("verificationReason").isNotBlank()
-                    val isVerified = if (data.has("verified")) {
-                        data.optBoolean("verified", true)
-                    } else {
-                        !hasVerificationReason
-                    }
-                    if (isVerified && !hasVerificationReason) {
-                        notifySessionToken(token)
-                    }
+                    notifySessionToken(token)
                 }
                 if (messageId.isNotBlank()) {
-                    reply(messageId, command, """{"ok":true}""")
+                    reply(channelId, messageId, command, """{"ok":true}""")
                 }
             }
             else -> {
-                if (command.contains("verified", ignoreCase = true)) {
-                    val token = data.optString("sessionToken", "").trim()
-                        .ifBlank { data.optString("token", "").trim() }
-                        .ifBlank { pendingSessionToken ?: "" }
-                    if (SESSION_TOKEN_HEX.matches(token)) {
-                        pendingSessionToken = token
-                        exchangeInProgress = false
-                        notifySessionToken(token)
-                    }
-                }
                 if (messageId.isNotBlank()) {
-                    reply(messageId, command, """{"ok":true}""")
+                    reply(channelId, messageId, command, """{"ok":true}""")
                 }
             }
         }
     }
 
-    fun notifySessionToken(token: String) {
-        if (!SESSION_TOKEN_HEX.matches(token)) return
-        if (exchangeInProgress) return
-        exchangeInProgress = true
-        pendingSessionToken = token
+    private fun notifySessionToken(token: String) {
+        if (!SESSION_TOKEN_HEX.matches(token) || token == lastSessionToken) return
+        lastSessionToken = token
         runCatching {
             CookieManager.getInstance().flush()
-            ControlPlaneHttp.cookieJar.syncFromWebView()
         }
-        val hawkInfo = runCatching { authRepository.buildOAuthHawkHeader(token) }.getOrNull()
         val view = webViewRef.get()
-        if (hawkInfo == null || view == null) {
-            fallbackSession(token)
-            return
-        }
-        val (hawkHeader, bodyJson) = hawkInfo
-        val script = """
-            (function() {
-              fetch('https://api.accounts.firefox.com/v1/oauth/token', {
-                method: 'POST',
-                headers: {
-                  'Authorization': ${jsString(hawkHeader)},
-                  'Content-Type': 'application/json'
-                },
-                body: ${jsString(bodyJson)}
-              }).then(function(res) {
-                return res.text().then(function(text) {
-                  foxyWebChannel.onOAuthResult(res.status, text);
-                });
-              }).catch(function(err) {
-                foxyWebChannel.onOAuthError(err ? (err.message || ('' + err)) : 'fetch_failed');
-              });
-            })();
-        """.trimIndent()
-        view.post {
-            runCatching { view.evaluateJavascript(script, null) }
-                .onFailure {
-                    fallbackSession(token)
-                }
+        if (view != null) {
+            view.post { onSessionToken(token) }
+        } else {
+            onSessionToken(token)
         }
     }
 
-    private fun reply(messageId: String, command: String, dataJson: String) {
+    private fun reply(channelId: String, messageId: String, command: String, dataJson: String) {
         val view = webViewRef.get() ?: return
         val script = "window.__foxyReply && window.__foxyReply(" +
-            "${jsString(FXA_CHANNEL_ID)}, ${jsString(messageId)}, ${jsString(command)}, ${jsString(dataJson)});"
+            "${jsString(channelId)}, ${jsString(messageId)}, ${jsString(command)}, $dataJson);"
         view.post {
             runCatching { view.evaluateJavascript(script, null) }
                 .onFailure { AppLogger.w(TAG, "could not answer webchannel command $command", it) }
@@ -360,26 +166,12 @@ internal class WebChannelBridge(
     }
 }
 
-private fun isSuccessUrl(url: String?): Boolean {
-    if (url.isNullOrBlank()) return false
-    val u = url.lowercase()
-    return u.contains("confirmed") ||
-        u.contains("/connect_another_device") ||
-        u.contains("/pair") ||
-        u.contains("/settings") ||
-        u.contains("/complete") ||
-        u.contains("/verified") ||
-        u.contains("success")
-}
-
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun BrowserLoginScreen(
     startUrl: String,
     busy: Boolean,
-    authRepository: FxaAuthRepository,
     errorMessage: String? = null,
-    onTokensCaptured: (String, String?, Long) -> Unit,
     onSessionCaptured: (String) -> Unit,
     onCanceled: () -> Unit,
 ) {
@@ -388,25 +180,18 @@ fun BrowserLoginScreen(
     var pageTitle by remember { mutableStateOf("") }
     var pageProgress by remember { mutableIntStateOf(0) }
     var pageLoaded by remember { mutableStateOf(false) }
-    val currentOnTokens by rememberUpdatedState(onTokensCaptured)
     val currentOnSession by rememberUpdatedState(onSessionCaptured)
     val currentOnCanceled by rememberUpdatedState(onCanceled)
 
     BackHandler(enabled = true) {
         if (webViewInstance?.canGoBack() == true) {
             webViewInstance?.goBack()
-        } else if (!busy) {
+        } else {
             currentOnCanceled()
         }
     }
 
-    fun handleTokens(accessToken: String, refreshToken: String?, expiresIn: Long) {
-        if (busy) return
-        currentOnTokens(accessToken, refreshToken, expiresIn)
-    }
-
     fun handleSession(token: String) {
-        if (busy) return
         currentOnSession(token)
     }
 
@@ -427,11 +212,10 @@ fun BrowserLoginScreen(
                 onClick = {
                     if (webViewInstance?.canGoBack() == true) {
                         webViewInstance?.goBack()
-                    } else if (!busy) {
+                    } else {
                         currentOnCanceled()
                     }
                 },
-                enabled = !busy,
             ) {
                 Icon(
                     Icons.AutoMirrored.Filled.ArrowBack,
@@ -478,11 +262,11 @@ fun BrowserLoginScreen(
                         settings.domStorageEnabled = true
                         settings.loadWithOverviewMode = true
                         settings.useWideViewPort = true
-                        settings.userAgentString = FIREFOX_ANDROID_UA
+                        settings.userAgentString = FirefoxAccountHeaders.browserUserAgent
                         val cookieManager = CookieManager.getInstance()
                         cookieManager.setAcceptCookie(true)
                         cookieManager.setAcceptThirdPartyCookies(this, true)
-                        val bridge = WebChannelBridge(this, authRepository, ::handleTokens, ::handleSession)
+                        val bridge = WebChannelBridge(this, ::handleSession)
                         bridgeInstance = bridge
                         addJavascriptInterface(bridge, "foxyWebChannel")
                         webViewClient = object : WebViewClient() {
@@ -511,17 +295,6 @@ fun BrowserLoginScreen(
                                 return true
                             }
 
-                            override fun doUpdateVisitedHistory(
-                                view: WebView,
-                                url: String?,
-                                isReload: Boolean,
-                            ) {
-                                super.doUpdateVisitedHistory(view, url, isReload)
-                                if (isSuccessUrl(url)) {
-                                    bridge.onSessionVerified()
-                                }
-                            }
-
                             override fun onPageStarted(
                                 view: WebView,
                                 url: String?,
@@ -529,9 +302,6 @@ fun BrowserLoginScreen(
                             ) {
                                 super.onPageStarted(view, url, favicon)
                                 pageLoaded = false
-                                if (isSuccessUrl(url)) {
-                                    bridge.onSessionVerified()
-                                }
                                 runCatching { view.evaluateJavascript(WEBCHANNEL_HOOK_JS, null) }
                             }
 
@@ -541,10 +311,6 @@ fun BrowserLoginScreen(
                                 pageTitle = view.title.orEmpty()
                                 runCatching {
                                     CookieManager.getInstance().flush()
-                                    ControlPlaneHttp.cookieJar.syncFromWebView()
-                                }
-                                if (isSuccessUrl(url)) {
-                                    bridge.onSessionVerified()
                                 }
                                 runCatching { view.evaluateJavascript(WEBCHANNEL_HOOK_JS, null) }
                             }
