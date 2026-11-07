@@ -14,8 +14,9 @@ import org.json.JSONObject
 
 const val GUARDIAN_ENDPOINT_DEFAULT = "https://vpn.mozilla.org"
 private const val TAG = "GuardianClient"
-private const val GUARDIAN_MAX_CHALLENGE_ATTEMPTS = 5
-private const val GUARDIAN_USER_AGENT = "MozillaVPN/2.35.0 (sys:android 14; iap:true)"
+private val guardianUserAgent: String
+    get() = FoxyRemoteConfig.current.guardian.headers["User-Agent"]
+        ?: FirefoxAccountHeaders.controlPlaneUserAgent
 
 class GuardianHttpError(
     message: String,
@@ -207,27 +208,26 @@ class GuardianClient(
         val origin = url.toHttpUrl().let { "${it.scheme}://${it.host}" }
 
         fun buildRequest(): Request {
-            val builder =
-                Request.Builder()
-                    .url(url)
-                    .header("User-Agent", GUARDIAN_USER_AGENT)
-                    .header("Accept", "application/json")
-                    .header("Content-Type", "application/json")
-                    .header("Cache-Control", "max-age=0")
-                    .header("Authorization", "Bearer $accessToken")
+            val builder = Request.Builder().url(url)
+            val headers = FoxyRemoteConfig.current.guardian.headers
+            for ((key, value) in headers) {
+                builder.header(key, value)
+            }
+            builder.header("Authorization", "Bearer $accessToken")
             if (method == "POST") builder.post(ByteArray(0).toRequestBody(null))
             return builder.build()
         }
         var response = ControlPlaneHttp.client.newCall(buildRequest()).awaitResponse()
         var attempts = 1
-        while (response.code == 406 && attempts < GUARDIAN_MAX_CHALLENGE_ATTEMPTS) {
+        while (response.code == 406 && attempts < 5) {
             val challengedBody = response.use { it.body?.readBoundedText().orEmpty() }
             try {
-                challengeSolver.solveAndInstall(challengedBody, origin, GUARDIAN_USER_AGENT)
+                challengeSolver.solveAndInstall(challengedBody, origin, guardianUserAgent)
             } catch (cancellation: CancellationException) {
                 throw cancellation
             } catch (solveFailure: Exception) {
                 AppLogger.w(TAG, "could not solve the Fastly challenge", solveFailure)
+                FoxyRemoteConfig.triggerRefresh()
                 throw GuardianHttpError(
                     "Mozilla's bot protection rejected this request (HTTP 406) and the challenge " +
                         "could not be solved automatically. Try again later or on another network.",
@@ -236,6 +236,9 @@ class GuardianClient(
             }
             response = ControlPlaneHttp.client.newCall(buildRequest()).awaitResponse()
             attempts++
+        }
+        if (response.code == 406) {
+            FoxyRemoteConfig.triggerRefresh()
         }
         return response
     }

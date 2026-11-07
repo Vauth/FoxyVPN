@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.content.res.Configuration
 import com.vauth.foxyvpn.data.ControlPlaneHttp
 import com.vauth.foxyvpn.data.CrashReporter
+import com.vauth.foxyvpn.data.FoxyRemoteConfig
 import com.vauth.foxyvpn.data.FxaAuthRepository
 import com.vauth.foxyvpn.data.GuardianClient
 import com.vauth.foxyvpn.data.ProxyStateStore
@@ -54,6 +55,8 @@ class FoxyVpnApp : Application(), AppContainer {
         ControlPlaneHttp.bootstrapDnsConfigProvider = {
             settingsStore.bootstrapDnsProvider to settingsStore.effectiveBootstrapDohUrl
         }
+        FoxyRemoteConfig.init(this)
+        FoxyRemoteConfig.triggerRefresh()
         guardianClient = GuardianClient()
         serverListClient = ServerListClient(this)
         authRepository = FxaAuthRepository(tokenStore)

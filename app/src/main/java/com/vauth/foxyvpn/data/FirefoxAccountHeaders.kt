@@ -13,16 +13,29 @@ internal object FirefoxAccountHeaders {
     private const val PRODUCT_DETAILS_URL =
         "https://product-details.mozilla.org/1.0/firefox_versions.json"
     private val mutex = Mutex()
-    @Volatile private var major = "135"
+    @Volatile private var major = "159"
     private var nextRefreshNanos: Long? = null
 
-    val userAgent: String
+    val controlPlaneUserAgent: String
+        get() = FoxyRemoteConfig.current.controlPlane.headers["User-Agent"]
+            ?: resolvePlaceholders("MozillaVPN/2.24.0 (sys:android {android_version})")
+
+    val browserUserAgent: String
+        get() = FoxyRemoteConfig.current.browser.headers["User-Agent"]
+            ?: resolvePlaceholders("Mozilla/5.0 (Android {android_version}; Mobile; rv:$major.0) Gecko/$major.0 Firefox/$major.0")
+
+    val desktopUserAgent: String
         get() = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:$major.0) Gecko/20100101 Firefox/$major.0"
 
+    val userAgent: String
+        get() = controlPlaneUserAgent
+
     fun apply(builder: Request.Builder): Request.Builder {
+        val headers = FoxyRemoteConfig.current.controlPlane.headers
+        for ((key, value) in headers) {
+            builder.header(key, value)
+        }
         return builder
-            .header("User-Agent", userAgent)
-            .header("Accept", "*/*")
     }
 
     suspend fun refresh(client: OkHttpClient) {

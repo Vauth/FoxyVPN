@@ -97,7 +97,7 @@ class LoginViewModel(private val repository: FxaAuthRepository) : ViewModel() {
             viewModelScope.launch {
                 try {
                     val result =
-                        withTimeout(120_000L) { repository.completeBrowserLogin(sessionToken) }
+                        withTimeout(300_000L) { repository.completeBrowserLogin(sessionToken) }
                     if (generation != requestGeneration) return@launch
                     result
                         .onSuccess {
