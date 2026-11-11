@@ -10,8 +10,6 @@ import okhttp3.Request
 import org.json.JSONObject
 
 internal object FirefoxAccountHeaders {
-    private const val PRODUCT_DETAILS_URL =
-        "https://product-details.mozilla.org/1.0/firefox_versions.json"
     private val mutex = Mutex()
     @Volatile private var major = "159"
     private var nextRefreshNanos: Long? = null
@@ -45,7 +43,7 @@ internal object FirefoxAccountHeaders {
                 try {
                     withTimeoutOrNull(5_000L) {
                         val request =
-                            apply(Request.Builder().url(PRODUCT_DETAILS_URL)).get().build()
+                            apply(Request.Builder().url(FoxyRemoteConfig.current.endpoints.productDetails)).get().build()
                         client.newCall(request).awaitResponse().use { response ->
                             if (!response.isSuccessful) return@withTimeoutOrNull false
                             val text =

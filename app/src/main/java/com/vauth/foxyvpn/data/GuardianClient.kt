@@ -51,7 +51,12 @@ class GuardianClient(
     suspend fun fetchProxyPass(endpoint: String, accessToken: String): ProxyPass =
         withTimeout(120_000L) {
             withContext(Dispatchers.IO) {
-                val url = "${endpoint.trimEnd('/')}/api/v1/fpn/token"
+                val url =
+                    if (endpoint == GUARDIAN_ENDPOINT_DEFAULT || endpoint.isBlank()) {
+                        FoxyRemoteConfig.current.endpoints.guardian.token
+                    } else {
+                        "${endpoint.trimEnd('/')}/api/v1/fpn/token"
+                    }
                 authorizedRequest("GET", url, accessToken).use { resp ->
                     when (resp.code) {
                         401,
@@ -125,7 +130,12 @@ class GuardianClient(
                     AppLogger.w(TAG, "could not fetch proxy pass for quota", e)
                 }
 
-                val statusUrl = "${endpoint.trimEnd('/')}/api/v1/fpn/status"
+                val statusUrl =
+                    if (endpoint == GUARDIAN_ENDPOINT_DEFAULT || endpoint.isBlank()) {
+                        FoxyRemoteConfig.current.endpoints.guardian.status
+                    } else {
+                        "${endpoint.trimEnd('/')}/api/v1/fpn/status"
+                    }
                 val statusEntitlement =
                     runCatching {
                         authorizedRequest("GET", statusUrl, accessToken).use { resp ->
@@ -165,7 +175,12 @@ class GuardianClient(
     suspend fun activateGuardian(endpoint: String, accessToken: String): Entitlement =
         withTimeout(120_000L) {
             withContext(Dispatchers.IO) {
-                val url = "${endpoint.trimEnd('/')}/api/v1/fpn/activate"
+                val url =
+                    if (endpoint == GUARDIAN_ENDPOINT_DEFAULT || endpoint.isBlank()) {
+                        FoxyRemoteConfig.current.endpoints.guardian.activate
+                    } else {
+                        "${endpoint.trimEnd('/')}/api/v1/fpn/activate"
+                    }
                 authorizedRequest("POST", url, accessToken).use { resp ->
                     val text = resp.body?.readBoundedText().orEmpty()
                     if (resp.code != 200) {

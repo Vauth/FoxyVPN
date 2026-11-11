@@ -51,8 +51,6 @@ class FxaRefreshFailure(message: String, val permanent: Boolean, cause: Throwabl
 
 class FastlyBlockedException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
-private const val FXA_AUTH_SERVER = "https://api.accounts.firefox.com/v1"
-private const val FXA_OAUTH_SERVER = "https://oauth.accounts.firefox.com/v1"
 private const val FIREFOX_CLIENT_ID = "5882386c6d801776"
 private const val OAUTH_SCOPE = "profile https://identity.mozilla.com/apps/vpn"
 private const val PROTOCOL_VERSION = "identity.mozilla.com/picl/v1/"
@@ -60,9 +58,6 @@ private const val FXA_MAX_CHALLENGE_ATTEMPTS = 5
 private const val DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
 private const val MAX_CONFIRM_ATTEMPTS = 100
 private const val CONFIRM_POLL_DELAY_MS = 3000L
-
-private const val WEBCHANNEL_LOGIN_URL =
-    "https://accounts.firefox.com/?context=fx_desktop_v3&service=sync&action=email"
 
 private val jsonMediaType = "application/json".toMediaType()
 
@@ -81,13 +76,13 @@ class FxaAuthRepository(
             .build()
     val storageError = tokenStore.storageError
 
-    fun getBrowserLoginUrl(): String = WEBCHANNEL_LOGIN_URL
+    fun getBrowserLoginUrl(): String = FoxyRemoteConfig.current.endpoints.controlPlane.login
 
     suspend fun isSessionVerified(sessionToken: String): Boolean =
         withContext(Dispatchers.IO) {
             val clean = sessionToken.trim().replace(Regex("[\\s\"]"), "").lowercase()
             if (!Regex("^[0-9a-f]{64}$").matches(clean)) return@withContext false
-            val url = "$FXA_AUTH_SERVER/recovery_email/status".toHttpUrl()
+            val url = FoxyRemoteConfig.current.endpoints.controlPlane.recoveryStatus.toHttpUrl()
             val (tokenId, hmacKey) = deriveHawkCredentials(clean)
             val header = hawkHeader("GET", url, tokenId, hmacKey, ByteArray(0))
             val request =
@@ -229,9 +224,9 @@ class FxaAuthRepository(
                 try {
                     FirefoxAccountHeaders.refresh(client)
                     try {
-                        executeFxaRequest(FXA_OAUTH_SERVER, "/token", jsonBody = body)
+                        executeFxaRequest(fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken, jsonBody = body)
                     } catch (_: FastlyBlockedException) {
-                        executeFxaRequest(FXA_AUTH_SERVER, "/oauth/token", jsonBody = body)
+                        executeFxaRequest(fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthFallback, jsonBody = body)
                     }
                 } catch (rejected: FxaApiError) {
                     throw FxaRefreshFailure(
@@ -304,7 +299,7 @@ class FxaAuthRepository(
         withContext(Dispatchers.IO) {
             val clean = sessionToken.trim().replace(Regex("[\\s\"]"), "").lowercase()
             if (!Regex("^[0-9a-f]{64}$").matches(clean)) return@withContext
-            val url = "$FXA_AUTH_SERVER/session/destroy".toHttpUrl()
+            val url = FoxyRemoteConfig.current.endpoints.controlPlane.sessionDestroy.toHttpUrl()
             val (tokenId, hmacKey) = deriveHawkCredentials(clean)
             val bodyBytes = "{}".toByteArray(Charsets.UTF_8)
             val header = hawkHeader("POST", url, tokenId, hmacKey, bodyBytes)
@@ -405,8 +400,7 @@ class FxaAuthRepository(
 
             val authResponse =
                 executeFxaRequest(
-                    baseUrl = FXA_AUTH_SERVER,
-                    path = "/oauth/authorization",
+                    fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.authorization,
                     jsonBody = authorizeBody,
                     sessionToken = sessionToken,
                 )
@@ -427,8 +421,7 @@ class FxaAuthRepository(
 
             val tokens =
                 executeFxaRequest(
-                    baseUrl = FXA_OAUTH_SERVER,
-                    path = "/token",
+                    fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken,
                     jsonBody = tokenBody,
                     sessionToken = null,
                 )
@@ -440,17 +433,15 @@ class FxaAuthRepository(
             tokens
         }
 
-
     private suspend fun executeFxaRequest(
-        baseUrl: String,
-        path: String,
+        fullUrl: String,
         method: String = "POST",
         jsonBody: JSONObject,
         sessionToken: String? = null,
     ): JSONObject =
         withTimeout(120_000L) {
             withContext(Dispatchers.IO) {
-                val url = "$baseUrl$path".toHttpUrl()
+                val url = fullUrl.toHttpUrl()
                 val origin = "${url.scheme}://${url.host}"
                 val bodyBytes = jsonBody.toString().toByteArray(Charsets.UTF_8)
                 val hawkCreds = sessionToken?.let { deriveHawkCredentials(it) }

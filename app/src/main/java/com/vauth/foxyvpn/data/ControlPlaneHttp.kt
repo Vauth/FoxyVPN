@@ -2,19 +2,38 @@ package com.vauth.foxyvpn.data
 
 import android.net.Network
 import android.webkit.CookieManager
+import java.io.IOException
+import java.net.Authenticator as JavaAuthenticator
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.PasswordAuthentication
+import java.net.Proxy
+import java.net.ProxySelector
 import java.net.Socket
+import java.net.SocketAddress
+import java.net.URI
 import java.util.concurrent.TimeUnit
 import javax.net.SocketFactory
+import okhttp3.Authenticator as OkHttpAuthenticator
 import okhttp3.Cookie
 import okhttp3.CookieJar
+import okhttp3.Credentials
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
+import okhttp3.Response
+import okhttp3.Route
 import okhttp3.dnsoverhttps.DnsOverHttps
+
+data class UpstreamProxyConfig(
+    val type: SettingsStore.UpstreamProxyType,
+    val host: String,
+    val port: Int,
+    val username: String = "",
+    val password: String = "",
+)
 
 fun Request.Builder.applyFirefoxHeaders(): Request.Builder = FirefoxAccountHeaders.apply(this)
 
@@ -129,6 +148,58 @@ object ControlPlaneHttp {
 
     @Volatile var bootstrapDnsConfigProvider: (() -> Pair<SettingsStore.DnsProvider, String>)? = null
 
+    @Volatile var upstreamProxyProvider: (() -> UpstreamProxyConfig?)? = null
+
+    @Volatile var relayerConfigProvider: (() -> RelayerConfig)? = null
+
+    private val relayerInterceptor = RelayerInterceptor { relayerConfigProvider?.invoke() }
+
+    init {
+        JavaAuthenticator.setDefault(
+            object : JavaAuthenticator() {
+                override fun getPasswordAuthentication(): PasswordAuthentication? {
+                    val config = upstreamProxyProvider?.invoke() ?: return null
+                    if (requestorType == RequestorType.PROXY && config.username.isNotBlank()) {
+                        return PasswordAuthentication(config.username, config.password.toCharArray())
+                    }
+                    return null
+                }
+            }
+        )
+    }
+
+    private val dynamicProxySelector =
+        object : ProxySelector() {
+            override fun select(uri: URI?): List<Proxy> {
+                val config = upstreamProxyProvider?.invoke()
+                if (config != null && config.host.isNotBlank() && config.port in 1..65535) {
+                    val proxyType =
+                        if (config.type == SettingsStore.UpstreamProxyType.HTTP) {
+                            Proxy.Type.HTTP
+                        } else {
+                            Proxy.Type.SOCKS
+                        }
+                    return listOf(Proxy(proxyType, InetSocketAddress.createUnresolved(config.host, config.port)))
+                }
+                return listOf(Proxy.NO_PROXY)
+            }
+
+            override fun connectFailed(uri: URI?, sa: SocketAddress?, ioe: IOException?) {}
+        }
+
+    private val dynamicProxyAuthenticator =
+        object : OkHttpAuthenticator {
+            override fun authenticate(route: Route?, response: Response): Request? {
+                val config = upstreamProxyProvider?.invoke() ?: return null
+                if (config.username.isBlank()) return null
+                if (response.request.header("Proxy-Authorization") != null) return null
+                val credential = Credentials.basic(config.username, config.password)
+                return response.request.newBuilder()
+                    .header("Proxy-Authorization", credential)
+                    .build()
+            }
+        }
+
     internal fun underlyingNetwork(): Network? {
         val provider = networkProvider ?: return null
         return provider() ?: throw java.io.IOException("No underlying network is available")
@@ -137,6 +208,9 @@ object ControlPlaneHttp {
     private val dohBootstrapClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            .addInterceptor(relayerInterceptor)
+            .proxySelector(dynamicProxySelector)
+            .proxyAuthenticator(dynamicProxyAuthenticator)
             .socketFactory(ProtectingSocketFactory())
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(10, TimeUnit.SECONDS)
@@ -199,7 +273,10 @@ object ControlPlaneHttp {
     val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            .addInterceptor(relayerInterceptor)
             .cookieJar(cookieJar)
+            .proxySelector(dynamicProxySelector)
+            .proxyAuthenticator(dynamicProxyAuthenticator)
             .socketFactory(ProtectingSocketFactory())
             .dns(
                 object : okhttp3.Dns {
