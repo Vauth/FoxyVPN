@@ -23,8 +23,40 @@ data class ComponentConfig(
     val protocols: List<Protocol> = listOf(Protocol.HTTP_2, Protocol.HTTP_1_1),
 )
 
+data class GuardianEndpoints(
+    val token: String = "https://vpn.mozilla.org/api/v1/fpn/token",
+    val status: String = "https://vpn.mozilla.org/api/v1/fpn/status",
+    val activate: String = "https://vpn.mozilla.org/api/v1/fpn/activate",
+)
+
+data class ControlPlaneEndpoints(
+    val oauthToken: String = "https://oauth.accounts.firefox.com/v1/token",
+    val oauthFallback: String = "https://api.accounts.firefox.com/v1/oauth/token",
+    val authorization: String = "https://api.accounts.firefox.com/v1/oauth/authorization",
+    val recoveryStatus: String = "https://api.accounts.firefox.com/v1/recovery_email/status",
+    val sessionDestroy: String = "https://api.accounts.firefox.com/v1/session/destroy",
+    val login: String = "https://accounts.firefox.com/?context=fx_desktop_v3&service=sync&action=email",
+)
+
+data class EndpointsConfig(
+    val guardian: GuardianEndpoints = GuardianEndpoints(),
+    val controlPlane: ControlPlaneEndpoints = ControlPlaneEndpoints(),
+    val serverList: String = "https://firefox.settings.services.mozilla.com/v1/buckets/main/collections/vpn-serverlist/records",
+    val productDetails: String = "https://product-details.mozilla.org/1.0/firefox_versions.json",
+    val exitCheck: String = "https://www.cloudflare.com/cdn-cgi/trace",
+    val latencyProbe: String = "https://www.gstatic.com/generate_204",
+)
+
+val DEFAULT_RELAYERS: Map<String, String> = emptyMap()
+val DEFAULT_RELAYER_ROUTES: Set<String> = setOf("guardian")
+val DEFAULT_FAILOVER_CODES: Set<Int> = setOf(451)
+
 data class RemoteConfig(
     val version: Int,
+    val endpoints: EndpointsConfig = EndpointsConfig(),
+    val relayerRoutes: Set<String> = DEFAULT_RELAYER_ROUTES,
+    val relayers: Map<String, String> = DEFAULT_RELAYERS,
+    val failoverCodes: Set<Int> = DEFAULT_FAILOVER_CODES,
     val controlPlane: ComponentConfig,
     val guardian: ComponentConfig,
     val solver: ComponentConfig,
@@ -91,6 +123,10 @@ private val DEFAULT_BROWSER =
 val DEFAULT_REMOTE_CONFIG =
     RemoteConfig(
         version = 1,
+        endpoints = EndpointsConfig(),
+        relayerRoutes = DEFAULT_RELAYER_ROUTES,
+        relayers = DEFAULT_RELAYERS,
+        failoverCodes = DEFAULT_FAILOVER_CODES,
         controlPlane = DEFAULT_CONTROL_PLANE,
         guardian = DEFAULT_GUARDIAN,
         solver = DEFAULT_SOLVER,
@@ -131,6 +167,9 @@ object FoxyRemoteConfig {
             if (parsed != null) {
                 current = parsed
                 lastRawJson = text
+                AppLogger.i(TAG, "loaded cached config (version ${parsed.version})")
+            } else {
+                AppLogger.w(TAG, "could not parse cached config; using defaults")
             }
         }
     }
@@ -153,11 +192,21 @@ object FoxyRemoteConfig {
                 val fetchedJson =
                     fetchRemoteJson(client, PRIMARY_URL)
                         ?: fetchRemoteJson(client, FALLBACK_URL)
-                        ?: return@withContext
+                        ?: run {
+                            AppLogger.w(TAG, "could not fetch remote config from primary or fallback")
+                            return@withContext
+                        }
 
-                if (fetchedJson == lastRawJson) return@withContext
+                if (fetchedJson.trim() == lastRawJson.trim()) {
+                    AppLogger.d(TAG, "remote config is up to date (version ${current.version})")
+                    return@withContext
+                }
 
-                val parsed = parseConfig(fetchedJson) ?: return@withContext
+                val parsed = parseConfig(fetchedJson)
+                if (parsed == null) {
+                    AppLogger.w(TAG, "could not parse fetched remote config")
+                    return@withContext
+                }
 
                 val file = File(context.filesDir, FILE_NAME)
                 val tempFile = File(context.filesDir, "$FILE_NAME.tmp")
@@ -176,7 +225,9 @@ object FoxyRemoteConfig {
                 if (writeSuccess) {
                     current = parsed
                     lastRawJson = fetchedJson
-                    AppLogger.i(TAG, "config updated")
+                    AppLogger.i(TAG, "config updated to version ${parsed.version}")
+                } else {
+                    AppLogger.w(TAG, "failed to persist remote config to disk")
                 }
             }
         }
@@ -192,14 +243,18 @@ object FoxyRemoteConfig {
                         .header("Cache-Control", "no-cache")
                         .build()
                 client.newCall(request).awaitResponse().use { response ->
-                    if (!response.isSuccessful) return@withTimeoutOrNull null
+                    if (!response.isSuccessful) {
+                        AppLogger.w(TAG, "fetching $url returned HTTP ${response.code}")
+                        return@withTimeoutOrNull null
+                    }
                     val text = response.body?.readBoundedText(128 * 1024).orEmpty().trim()
                     if (text.startsWith("{") && text.endsWith("}")) text else null
                 }
             }
         } catch (cancellation: CancellationException) {
             throw cancellation
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "failed to fetch config from $url: ${e.message}")
             null
         }
     }
@@ -208,6 +263,44 @@ object FoxyRemoteConfig {
         return runCatching {
             val root = JSONObject(jsonString)
             val version = root.optInt("version", 1)
+
+            fun parseEndpoints(): EndpointsConfig {
+                val defaultEndpoints = EndpointsConfig()
+                val endpointsObj = root.optJSONObject("endpoints") ?: return defaultEndpoints
+                val guardianObj = endpointsObj.optJSONObject("guardian")
+                val guardian =
+                    if (guardianObj != null) {
+                        val d = defaultEndpoints.guardian
+                        GuardianEndpoints(
+                            token = guardianObj.optString("token", "").ifBlank { d.token },
+                            status = guardianObj.optString("status", "").ifBlank { d.status },
+                            activate = guardianObj.optString("activate", "").ifBlank { d.activate },
+                        )
+                    } else defaultEndpoints.guardian
+
+                val cpObj = endpointsObj.optJSONObject("controlPlane")
+                val controlPlane =
+                    if (cpObj != null) {
+                        val d = defaultEndpoints.controlPlane
+                        ControlPlaneEndpoints(
+                            oauthToken = cpObj.optString("oauthToken", "").ifBlank { d.oauthToken },
+                            oauthFallback = cpObj.optString("oauthFallback", "").ifBlank { d.oauthFallback },
+                            authorization = cpObj.optString("authorization", "").ifBlank { d.authorization },
+                            recoveryStatus = cpObj.optString("recoveryStatus", "").ifBlank { d.recoveryStatus },
+                            sessionDestroy = cpObj.optString("sessionDestroy", "").ifBlank { d.sessionDestroy },
+                            login = cpObj.optString("login", "").ifBlank { d.login },
+                        )
+                    } else defaultEndpoints.controlPlane
+
+                return EndpointsConfig(
+                    guardian = guardian,
+                    controlPlane = controlPlane,
+                    serverList = endpointsObj.optString("serverList", "").ifBlank { defaultEndpoints.serverList },
+                    productDetails = endpointsObj.optString("productDetails", "").ifBlank { defaultEndpoints.productDetails },
+                    exitCheck = endpointsObj.optString("exitCheck", "").ifBlank { defaultEndpoints.exitCheck },
+                    latencyProbe = endpointsObj.optString("latencyProbe", "").ifBlank { defaultEndpoints.latencyProbe },
+                )
+            }
 
             fun parseComponent(name: String, default: ComponentConfig): ComponentConfig {
                 val obj = root.optJSONObject(name) ?: return default
@@ -243,8 +336,54 @@ object FoxyRemoteConfig {
                 return ComponentConfig(headers = headers, protocols = protocols)
             }
 
+            fun parseRelayers(): Map<String, String> {
+                val obj = root.optJSONObject("relayers") ?: return emptyMap()
+                val result = mutableMapOf<String, String>()
+                for (key in obj.keys()) {
+                    val raw = obj.optString(key, "").trim()
+                    if (raw.isNotEmpty()) {
+                        val url =
+                            if (raw.startsWith("http://", ignoreCase = true) || raw.startsWith("https://", ignoreCase = true)) {
+                                raw
+                            } else {
+                                "https://$raw"
+                            }
+                        result[key] = url
+                    }
+                }
+                return result
+            }
+
+            fun parseRelayerRoutes(): Set<String> {
+                val arr = root.optJSONArray("relayerRoutes") ?: return DEFAULT_RELAYER_ROUTES
+                val set = mutableSetOf<String>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optString(i, "").trim().lowercase()
+                    if (item.isNotEmpty()) {
+                        set.add(item)
+                    }
+                }
+                return if (set.isNotEmpty()) set else DEFAULT_RELAYER_ROUTES
+            }
+
+            fun parseFailoverCodes(): Set<Int> {
+                val arr = root.optJSONArray("failoverCodes") ?: return DEFAULT_FAILOVER_CODES
+                val set = mutableSetOf<Int>()
+                for (i in 0 until arr.length()) {
+                    val code = arr.optInt(i, -1)
+                    if (code in 100..599) {
+                        set.add(code)
+                    }
+                }
+                return if (set.isNotEmpty()) set else DEFAULT_FAILOVER_CODES
+            }
+
             RemoteConfig(
                 version = version,
+                endpoints = parseEndpoints(),
+                relayerRoutes = parseRelayerRoutes(),
+                relayers = parseRelayers(),
+                failoverCodes = parseFailoverCodes(),
                 controlPlane = parseComponent("controlPlane", DEFAULT_CONTROL_PLANE),
                 guardian = parseComponent("guardian", DEFAULT_GUARDIAN),
                 solver = parseComponent("solver", DEFAULT_SOLVER),

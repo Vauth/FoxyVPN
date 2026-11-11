@@ -19,9 +19,6 @@ import org.json.JSONObject
 
 private const val TAG = "ServerListClient"
 
-private const val REMOTE_SETTINGS_URL =
-    "https://firefox.settings.services.mozilla.com/v1/buckets/main/collections/vpn-serverlist/records"
-
 const val RECOMMENDED_COUNTRY_CODE = com.vauth.foxyvpn.data.model.RECOMMENDED_COUNTRY_CODE
 
 private val EXCLUDED_COUNTRY_NAMES = setOf("CatchAll Anycast")
@@ -42,7 +39,10 @@ class ServerListClient(
     suspend fun fetchCountries(): List<VpnCountry> =
         withContext(Dispatchers.IO) {
             val request =
-                Request.Builder().url(REMOTE_SETTINGS_URL).applyFirefoxHeaders().build()
+                Request.Builder()
+                    .url(FoxyRemoteConfig.current.endpoints.serverList)
+                    .applyFirefoxHeaders()
+                    .build()
             client.newCall(request).awaitResponse().use { response ->
                 if (!response.isSuccessful) {
                     throw IOException("Remote Settings fetch failed: HTTP ${response.code}")

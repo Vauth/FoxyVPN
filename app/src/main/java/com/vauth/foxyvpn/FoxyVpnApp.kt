@@ -10,9 +10,11 @@ import com.vauth.foxyvpn.data.FoxyRemoteConfig
 import com.vauth.foxyvpn.data.FxaAuthRepository
 import com.vauth.foxyvpn.data.GuardianClient
 import com.vauth.foxyvpn.data.ProxyStateStore
+import com.vauth.foxyvpn.data.RelayerConfig
 import com.vauth.foxyvpn.data.ServerListClient
 import com.vauth.foxyvpn.data.SettingsStore
 import com.vauth.foxyvpn.data.TokenStore
+import com.vauth.foxyvpn.data.UpstreamProxyConfig
 import com.vauth.foxyvpn.update.AppUpdater
 import com.vauth.foxyvpn.vpn.FoxyVpnService
 import com.vauth.foxyvpn.widget.QuickConnectWidgetProvider
@@ -54,6 +56,26 @@ class FoxyVpnApp : Application(), AppContainer {
         settingsStore = SettingsStore(this)
         ControlPlaneHttp.bootstrapDnsConfigProvider = {
             settingsStore.bootstrapDnsProvider to settingsStore.effectiveBootstrapDohUrl
+        }
+        ControlPlaneHttp.upstreamProxyProvider = {
+            if (settingsStore.upstreamProxyEnabled && settingsStore.upstreamProxyHost.isNotBlank()) {
+                UpstreamProxyConfig(
+                    type = settingsStore.upstreamProxyType,
+                    host = settingsStore.upstreamProxyHost,
+                    port = settingsStore.upstreamProxyPort,
+                    username = settingsStore.upstreamProxyUsername,
+                    password = settingsStore.upstreamProxyPassword,
+                )
+            } else null
+        }
+        ControlPlaneHttp.relayerConfigProvider = {
+            RelayerConfig(
+                provider = settingsStore.relayerProvider,
+                customUrl = settingsStore.customRelayerUrl,
+                relayedEndpoints = settingsStore.relayedEndpoints,
+                availableRelayers = FoxyRemoteConfig.current.relayers,
+                failoverCodes = FoxyRemoteConfig.current.failoverCodes,
+            )
         }
         FoxyRemoteConfig.init(this)
         FoxyRemoteConfig.triggerRefresh()

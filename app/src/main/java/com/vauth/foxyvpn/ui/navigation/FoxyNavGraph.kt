@@ -67,11 +67,13 @@ fun FoxyNavGraph(
         composable(FoxyRoutes.LOGIN) {
             LoginScreen(
                 authRepository = container.authRepository,
+                themeController = themeController,
                 onSignedIn = {
                     navController.navigate(FoxyRoutes.HOME) {
                         popUpTo(FoxyRoutes.LOGIN) { inclusive = true }
                     }
                 },
+                onOpenSettings = { navController.navigate(FoxyRoutes.SETTINGS) },
             )
         }
         composable(FoxyRoutes.HOME) {
@@ -117,8 +119,10 @@ fun FoxyNavGraph(
             var autoUpdates by remember { mutableStateOf(updater?.automaticChecks ?: false) }
             val manualUpdate by updater?.manualUpdate?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(null) }
+            val isSignedIn = remember(container.tokenStore.sessionEpoch) { container.tokenStore.hasStoredSession() }
             SettingsScreen(
                 settingsStore = container.settingsStore,
+                isSignedIn = isSignedIn,
                 onOpenLogs = { navController.navigate(FoxyRoutes.LOGS) },
                 signOutInProgress = signingOut,
                 onCheckForUpdates = {

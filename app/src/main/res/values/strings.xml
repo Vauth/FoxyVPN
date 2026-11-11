@@ -195,4 +195,28 @@
     <string name="theme_desc_system_dark">Theme: follows the system. Tap for dark mode</string>
     <string name="theme_desc_light">Theme: light. Tap for dark mode, long press to follow the system</string>
     <string name="theme_desc_dark">Theme: dark. Tap for light mode, long press to follow the system</string>
+
+    <string name="settings_section_relayer">Relayer</string>
+    <string name="settings_relayer_provider">Relayer provider</string>
+    <string name="settings_relayer_provider_help">Route control plane and API endpoints through a relayer.</string>
+    <string name="settings_relayer_endpoints">Routed endpoints</string>
+    <string name="settings_relayer_endpoints_help">Choose which endpoints pass through the relayer.</string>
+    <string name="settings_relayer_automatic">Automatic</string>
+    <string name="settings_relayer_automatic_desc">Tries direct first; fails over to relayer on block or error</string>
+    <string name="settings_relayer_direct">Direct</string>
+    <string name="settings_relayer_direct_desc">Connect directly without relayer</string>
+    <string name="settings_relayer_custom">Custom relayer</string>
+    <string name="settings_relayer_custom_desc">Custom HTTP or HTTPS worker</string>
+    <string name="settings_relayer_custom_url">Custom relayer URL</string>
+    <string name="settings_relayer_custom_url_placeholder">https://your-worker.example.com</string>
+    <string name="settings_relayer_custom_url_help">HTTP or HTTPS URL supporting ?url= parameter</string>
+    <string name="settings_relayer_ep_guardian">Guardian</string>
+    <string name="settings_relayer_ep_guardian_desc">/api/v1/fpn/token, /status, /activate</string>
+    <string name="settings_relayer_ep_fxa">Firefox Accounts</string>
+    <string name="settings_relayer_ep_fxa_desc">/oauth/token, /authorization, /session</string>
+    <string name="settings_relayer_ep_config">Remote Config</string>
+    <string name="settings_relayer_ep_config_desc">GitHub / jsdelivr config sync</string>
+    <string name="settings_relayer_ep_server_list">Server List</string>
+    <string name="settings_relayer_ep_server_list_desc">Mozilla Remote Settings catalog</string>
+    <string name="settings_relayer_test_latency">Test latency</string>
 </resources>

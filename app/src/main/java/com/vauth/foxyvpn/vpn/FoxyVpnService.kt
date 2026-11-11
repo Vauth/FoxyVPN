@@ -22,6 +22,7 @@ import com.vauth.foxyvpn.FoxyVpnApp
 import com.vauth.foxyvpn.MainActivity
 import com.vauth.foxyvpn.data.AppLogger
 import com.vauth.foxyvpn.data.ControlPlaneHttp
+import com.vauth.foxyvpn.data.FoxyRemoteConfig
 import com.vauth.foxyvpn.data.FxaRefreshFailure
 import com.vauth.foxyvpn.data.GUARDIAN_ENDPOINT_DEFAULT
 import com.vauth.foxyvpn.data.GuardianClient
@@ -1069,8 +1070,8 @@ class FoxyVpnService : VpnService() {
                 val credentials = activeProxyCredentials
                 val urls =
                     listOf(
-                        "https://www.gstatic.com/generate_204",
-                        "https://www.cloudflare.com/cdn-cgi/trace",
+                        FoxyRemoteConfig.current.endpoints.latencyProbe,
+                        FoxyRemoteConfig.current.endpoints.exitCheck,
                     )
                 fun current() = isActive && isCurrentSession(generation)
                 while (current()) {

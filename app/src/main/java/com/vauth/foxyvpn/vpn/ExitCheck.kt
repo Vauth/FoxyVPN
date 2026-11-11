@@ -1,6 +1,7 @@
 package com.vauth.foxyvpn.vpn
 
 import com.vauth.foxyvpn.data.ControlPlaneHttp
+import com.vauth.foxyvpn.data.FoxyRemoteConfig
 import com.vauth.foxyvpn.data.SettingsStore
 import com.vauth.foxyvpn.data.awaitResponse
 import com.vauth.foxyvpn.data.readBoundedText
@@ -8,8 +9,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Request
-
-private const val EXIT_CHECK_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 
 private const val EXIT_CHECK_TIMEOUT_SECONDS = 15L
 
@@ -20,7 +19,8 @@ class ExitCheck {
     suspend fun fetchDirectIpInfo(): Result<IpLocationInfo> =
         withContext(Dispatchers.IO) {
             runCatching {
-                    val request = Request.Builder().url(EXIT_CHECK_URL).build()
+                    val url = FoxyRemoteConfig.current.endpoints.exitCheck
+                    val request = Request.Builder().url(url).build()
                     ControlPlaneHttp.client.newCall(request).awaitResponse().use { response ->
                         check(response.isSuccessful) {
                             "Direct IP check failed: HTTP ${response.code}"
@@ -40,7 +40,8 @@ class ExitCheck {
             val client = localProxyClient(socksPort, username, password, EXIT_CHECK_TIMEOUT_SECONDS)
             try {
                 runCatching {
-                        val request = Request.Builder().url(EXIT_CHECK_URL).build()
+                        val url = FoxyRemoteConfig.current.endpoints.exitCheck
+                        val request = Request.Builder().url(url).build()
                         client.newCall(request).awaitResponse().use { response ->
                             if (!response.isSuccessful)
                                 error("Proxied exit check failed: HTTP ${response.code}")

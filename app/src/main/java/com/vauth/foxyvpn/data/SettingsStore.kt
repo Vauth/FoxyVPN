@@ -86,6 +86,7 @@ class SettingsStore(context: Context) {
     var latencyProbeUrl: String
         get() =
             prefs.getString(KEY_LATENCY_PROBE_URL, null)?.takeIf { isValidProbeUrl(it) }
+                ?: FoxyRemoteConfig.current.endpoints.latencyProbe.takeIf { isValidProbeUrl(it) }
                 ?: DEFAULT_LATENCY_PROBE_URL
         set(value) {
             val url = value.trim()
@@ -275,6 +276,49 @@ class SettingsStore(context: Context) {
                 DnsProvider.DIRECT_SYSTEM -> ""
                 else -> bootstrapDnsProvider.dohUrl
             }
+
+    var relayerProvider: String
+        get() = prefs.getString(KEY_RELAYER_PROVIDER, RELAYER_AUTOMATIC) ?: RELAYER_AUTOMATIC
+        set(value) {
+            prefs.edit().putString(KEY_RELAYER_PROVIDER, value.trim()).apply()
+        }
+
+    var customRelayerUrl: String
+        get() = prefs.getString(KEY_CUSTOM_RELAYER_URL, "") ?: ""
+        set(value) {
+            val trimmed = value.trim()
+            require(trimmed.isEmpty() || isValidRelayerUrl(trimmed)) {
+                "Relayer URL must be a valid HTTP or HTTPS address"
+            }
+            val normalized = if (trimmed.isNotEmpty() && !trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
+                "https://$trimmed"
+            } else {
+                trimmed
+            }
+            prefs.edit().putString(KEY_CUSTOM_RELAYER_URL, normalized).apply()
+        }
+
+    fun saveRelayer(provider: String, customUrl: String) {
+        val trimmed = customUrl.trim()
+        require(provider != RELAYER_CUSTOM || isValidRelayerUrl(trimmed)) {
+            "Enter a valid HTTP or HTTPS relayer URL"
+        }
+        val normalized = if (trimmed.isNotEmpty() && !trimmed.startsWith("http://", ignoreCase = true) && !trimmed.startsWith("https://", ignoreCase = true)) {
+            "https://$trimmed"
+        } else {
+            trimmed
+        }
+        prefs.edit()
+            .putString(KEY_RELAYER_PROVIDER, provider.trim())
+            .putString(KEY_CUSTOM_RELAYER_URL, normalized)
+            .apply()
+    }
+
+    var relayedEndpoints: Set<String>
+        get() = prefs.getStringSet(KEY_RELAYED_ENDPOINTS, null) ?: FoxyRemoteConfig.current.relayerRoutes
+        set(value) {
+            prefs.edit().putStringSet(KEY_RELAYED_ENDPOINTS, value).apply()
+        }
 
     var tlsFragmentMode: TlsFragmentMode
         get() =
@@ -609,6 +653,30 @@ class SettingsStore(context: Context) {
                         (uri.port == -1 || uri.port in 1..65_535)
                 }
                 .getOrDefault(false)
+
+        const val RELAYER_AUTOMATIC = "AUTOMATIC"
+        const val RELAYER_DIRECT = "DIRECT"
+        const val RELAYER_CUSTOM = "CUSTOM"
+        val DEFAULT_RELAYED_ENDPOINTS = setOf("guardian")
+        private const val KEY_RELAYER_PROVIDER = "relayer_provider"
+        private const val KEY_CUSTOM_RELAYER_URL = "custom_relayer_url"
+        private const val KEY_RELAYED_ENDPOINTS = "relayed_endpoints"
+
+        fun isValidRelayerUrl(value: String): Boolean =
+            runCatching {
+                val trimmed = value.trim()
+                val normalized = if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) {
+                    trimmed
+                } else {
+                    "https://$trimmed"
+                }
+                val uri = java.net.URI(normalized)
+                (uri.scheme.equals("https", ignoreCase = true) || uri.scheme.equals("http", ignoreCase = true)) &&
+                    !uri.host.isNullOrBlank() &&
+                    uri.rawUserInfo == null &&
+                    uri.rawFragment == null &&
+                    (uri.port == -1 || uri.port in 1..65_535)
+            }.getOrDefault(false)
 
         private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_CUSTOM_MTU = "custom_mtu"

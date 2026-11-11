@@ -37,6 +37,33 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         val solverMutex = Mutex()
     }
 
+    private fun allowedHosts(): Set<String> {
+        val hosts = mutableSetOf(
+            "vpn.mozilla.org",
+            "api.accounts.firefox.com",
+            "oauth.accounts.firefox.com",
+            "accounts.firefox.com",
+        )
+        val endpoints = FoxyRemoteConfig.current.endpoints
+        val urls = listOf(
+            endpoints.controlPlane.login,
+            endpoints.controlPlane.recoveryStatus,
+            endpoints.controlPlane.sessionDestroy,
+            endpoints.controlPlane.oauthToken,
+            endpoints.controlPlane.oauthFallback,
+            endpoints.controlPlane.authorization,
+            endpoints.guardian.token,
+            endpoints.guardian.status,
+            endpoints.guardian.activate,
+            endpoints.serverList,
+            endpoints.productDetails,
+        )
+        for (url in urls) {
+            runCatching { url.toHttpUrl().host }.getOrNull()?.let { hosts.add(it) }
+        }
+        return hosts
+    }
+
     suspend fun solveAndInstall(
         challengedBody: String? = null,
         challengedOrigin: String? = null,
@@ -47,18 +74,13 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                 withContext(Dispatchers.IO) {
                     val origin =
                         (challengedOrigin ?: "https://api.accounts.firefox.com").toHttpUrl()
+                    val trustedHosts = allowedHosts()
                     require(
                         origin.scheme == "https" &&
                             origin.port == 443 &&
                             origin.username.isEmpty() &&
                             origin.password.isEmpty() &&
-                            origin.host in
-                                setOf(
-                                    "vpn.mozilla.org",
-                                    "api.accounts.firefox.com",
-                                    "oauth.accounts.firefox.com",
-                                    "accounts.firefox.com",
-                                )
+                            origin.host in trustedHosts
                     ) {
                         "Untrusted challenge origin"
                     }
@@ -69,9 +91,13 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                         solveChallengePage(challengedBody, base, userAgent, solver, solverJar)
                         return@withContext
                     }
+                    val defaultBase =
+                        runCatching { FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken.toHttpUrl() }
+                            .getOrNull()?.let { "https://${it.host}" } ?: "https://api.accounts.firefox.com"
                     val bases =
                         listOf(
                             base,
+                            defaultBase,
                             "https://api.accounts.firefox.com",
                             "https://accounts.firefox.com",
                         ).distinct()
@@ -291,13 +317,7 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         if (cookies.isEmpty())
             throw FastlyChallengeError("challenge completed but no cookies were issued")
 
-        val targetHosts =
-            listOf(
-                "api.accounts.firefox.com",
-                "accounts.firefox.com",
-                "oauth.accounts.firefox.com",
-                "vpn.mozilla.org",
-            )
+        val targetHosts = allowedHosts()
 
         for (cookie in cookies) {
             val hostClean = cookie.domain.trimStart('.')

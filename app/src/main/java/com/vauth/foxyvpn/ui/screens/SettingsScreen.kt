@@ -49,6 +49,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vauth.foxyvpn.BuildConfig
 import com.vauth.foxyvpn.R
+import com.vauth.foxyvpn.data.FoxyRemoteConfig
 import com.vauth.foxyvpn.data.ProxySettingsRepository
 import com.vauth.foxyvpn.data.SettingsStore
 import com.vauth.foxyvpn.ui.ProxyEditor
@@ -61,9 +62,12 @@ import com.vauth.foxyvpn.ui.settings.IpModePickerDialog
 import com.vauth.foxyvpn.ui.settings.LatencyProbeDialog
 import com.vauth.foxyvpn.ui.settings.MtuPickerDialog
 import com.vauth.foxyvpn.ui.settings.ProxySettingsDialog
+import com.vauth.foxyvpn.ui.settings.RelayedEndpointsDialog
+import com.vauth.foxyvpn.ui.settings.RelayerProviderPickerDialog
 import com.vauth.foxyvpn.ui.settings.SplitTunnelDialog
 import com.vauth.foxyvpn.ui.settings.TlsFragmentPickerDialog
 import com.vauth.foxyvpn.ui.settings.UtlsFingerprintPickerDialog
+import java.util.Locale
 import com.vauth.foxyvpn.update.ReleaseInfo
 import com.vauth.foxyvpn.vpn.FoxyVpnService
 import com.vauth.foxyvpn.vpn.TunnelHealth
@@ -83,6 +87,8 @@ private enum class SettingsDialog {
     SPLIT_TUNNEL,
     HTTP_VERSION,
     IP_MODE,
+    RELAYER_PROVIDER,
+    RELAYER_ENDPOINTS,
 }
 
 @Composable
@@ -91,6 +97,7 @@ fun SettingsScreen(
     onOpenLogs: () -> Unit,
     onSignOut: () -> Unit,
     onBack: () -> Unit,
+    isSignedIn: Boolean = true,
     signOutInProgress: Boolean = false,
     onCheckForUpdates: (() -> Unit)? = null,
     manualUpdate: ReleaseInfo? = null,
@@ -119,6 +126,9 @@ fun SettingsScreen(
     var utlsFingerprint by remember { mutableStateOf(settingsStore.utlsFingerprint) }
     var maxConcurrentStreams by remember { mutableIntStateOf(settingsStore.maxConcurrentStreams) }
     var ipMode by remember { mutableStateOf(settingsStore.ipMode) }
+    var relayerProvider by remember { mutableStateOf(settingsStore.relayerProvider) }
+    var customRelayerUrl by remember { mutableStateOf(settingsStore.customRelayerUrl) }
+    var relayedEndpoints by remember { mutableStateOf(settingsStore.relayedEndpoints) }
     var activeDialog by rememberSaveable { mutableStateOf(SettingsDialog.NONE) }
 
     val proxyViewModel: ProxySettingsViewModel =
@@ -294,6 +304,27 @@ fun SettingsScreen(
                 activeDialog = SettingsDialog.NONE
             },
         )
+        SettingsDialog.RELAYER_PROVIDER -> RelayerProviderPickerDialog(
+            currentProvider = relayerProvider,
+            currentCustomUrl = customRelayerUrl,
+            availableRelayers = FoxyRemoteConfig.current.relayers,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = { provider, customUrl ->
+                settingsStore.saveRelayer(provider, customUrl)
+                relayerProvider = provider
+                customRelayerUrl = settingsStore.customRelayerUrl
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.RELAYER_ENDPOINTS -> RelayedEndpointsDialog(
+            currentEndpoints = relayedEndpoints,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = { endpoints ->
+                settingsStore.relayedEndpoints = endpoints
+                relayedEndpoints = endpoints
+                activeDialog = SettingsDialog.NONE
+            },
+        )
     }
 
     Scaffold(
@@ -386,6 +417,57 @@ fun SettingsScreen(
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
                 modifier = Modifier.clickable { activeDialog = SettingsDialog.BOOTSTRAP_DNS_PROVIDER },
+            )
+
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            SectionLabel(stringResource(R.string.settings_section_relayer))
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_relayer_provider)) },
+                supportingContent = {
+                    val label = when {
+                        relayerProvider.equals(SettingsStore.RELAYER_AUTOMATIC, ignoreCase = true) ->
+                            stringResource(R.string.settings_relayer_automatic)
+                        relayerProvider.equals(SettingsStore.RELAYER_DIRECT, ignoreCase = true) ->
+                            stringResource(R.string.settings_relayer_direct)
+                        relayerProvider.equals(SettingsStore.RELAYER_CUSTOM, ignoreCase = true) ->
+                            customRelayerUrl.ifBlank { stringResource(R.string.settings_relayer_custom) }
+                        else -> {
+                            val entry = FoxyRemoteConfig.current.relayers.entries.firstOrNull {
+                                it.key.equals(relayerProvider, ignoreCase = true)
+                            }
+                            if (entry != null) {
+                                entry.key.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+                            } else {
+                                relayerProvider
+                            }
+                        }
+                    }
+                    Text(label)
+                },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.RELAYER_PROVIDER },
+            )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_relayer_endpoints)) },
+                supportingContent = {
+                    val summary = if (relayedEndpoints.isEmpty()) {
+                        stringResource(R.string.settings_none)
+                    } else {
+                        val names = mutableListOf<String>()
+                        if ("guardian" in relayedEndpoints) names.add(stringResource(R.string.settings_relayer_ep_guardian))
+                        if ("fxa" in relayedEndpoints) names.add(stringResource(R.string.settings_relayer_ep_fxa))
+                        if ("config" in relayedEndpoints) names.add(stringResource(R.string.settings_relayer_ep_config))
+                        if ("server_list" in relayedEndpoints) names.add(stringResource(R.string.settings_relayer_ep_server_list))
+                        names.joinToString(", ")
+                    }
+                    Text(summary)
+                },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.RELAYER_ENDPOINTS },
             )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
@@ -707,20 +789,22 @@ fun SettingsScreen(
                     },
             )
 
-            HorizontalDivider(Modifier.padding(vertical = 8.dp))
-            Button(
-                onClick = onSignOut,
-                enabled = !signOutInProgress,
-                colors =
-                    ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                    ),
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            ) {
-                Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text(stringResource(R.string.settings_sign_out))
+            if (isSignedIn) {
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Button(
+                    onClick = onSignOut,
+                    enabled = !signOutInProgress,
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                        ),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.settings_sign_out))
+                }
             }
         }
     }
