@@ -52,7 +52,7 @@ class HomeViewModel(
                 network: Network,
                 capabilities: NetworkCapabilities,
             ) {
-                if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
                     refreshAddress()
                     refreshAccount()
                 }

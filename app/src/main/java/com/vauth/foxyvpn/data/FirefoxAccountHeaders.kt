@@ -22,12 +22,6 @@ internal object FirefoxAccountHeaders {
         get() = FoxyRemoteConfig.current.browser.headers["User-Agent"]
             ?: resolvePlaceholders("Mozilla/5.0 (Android {android_version}; Mobile; rv:$major.0) Gecko/$major.0 Firefox/$major.0")
 
-    val desktopUserAgent: String
-        get() = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:$major.0) Gecko/20100101 Firefox/$major.0"
-
-    val userAgent: String
-        get() = controlPlaneUserAgent
-
     fun apply(builder: Request.Builder): Request.Builder {
         val headers = FoxyRemoteConfig.current.controlPlane.headers
         for ((key, value) in headers) {
@@ -35,6 +29,8 @@ internal object FirefoxAccountHeaders {
         }
         return builder
     }
+
+    fun applyOAuth(builder: Request.Builder): Request.Builder = apply(builder)
 
     suspend fun refresh(client: OkHttpClient) {
         mutex.withLock {

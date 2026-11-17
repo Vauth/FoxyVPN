@@ -3,6 +3,7 @@ package com.vauth.foxyvpn.widget
 import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -34,9 +35,9 @@ class QuickConnectWidgetProvider : AppWidgetProvider() {
         }
     }
 
-    override fun onReceive(context: Context, intent: Intent) {
-        super.onReceive(context, intent)
-        if (intent.action == ACTION_TOGGLE_VPN) {
+    class ToggleReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_TOGGLE_VPN) return
             if (FoxyVpnService.state.value != ConnectionState.DISCONNECTED) {
                 FoxyVpnService.stop(context)
                 return
@@ -64,43 +65,43 @@ class QuickConnectWidgetProvider : AppWidgetProvider() {
         }
     }
 
-    private fun handleToggle(context: Context, signedIn: Boolean) {
-        when (FoxyVpnService.state.value) {
-            ConnectionState.CONNECTED,
-            ConnectionState.CONNECTING -> return
-            ConnectionState.DISCONNECTED -> {
-                val app = context.applicationContext as? FoxyVpnApp
-                if (!signedIn) {
-                    launchMainActivity(context)
-                    return
-                }
+    companion object {
+        const val ACTION_TOGGLE_VPN = "com.vauth.foxyvpn.action.TOGGLE_VPN"
 
-                val settingsStore = app?.settingsStore ?: SettingsStore(context)
-                if (settingsStore.proxyOnlyMode) {
-                    FoxyVpnService.start(context)
-                    return
-                }
+        private fun handleToggle(context: Context, signedIn: Boolean) {
+            when (FoxyVpnService.state.value) {
+                ConnectionState.CONNECTED,
+                ConnectionState.CONNECTING -> return
+                ConnectionState.DISCONNECTED -> {
+                    val app = context.applicationContext as? FoxyVpnApp
+                    if (!signedIn) {
+                        launchMainActivity(context)
+                        return
+                    }
 
-                val prepareIntent = VpnService.prepare(context)
-                if (prepareIntent != null) {
-                    launchMainActivity(context)
-                } else {
-                    FoxyVpnService.start(context)
+                    val settingsStore = app?.settingsStore ?: SettingsStore(context)
+                    if (settingsStore.proxyOnlyMode) {
+                        FoxyVpnService.start(context)
+                        return
+                    }
+
+                    val prepareIntent = VpnService.prepare(context)
+                    if (prepareIntent != null) {
+                        launchMainActivity(context)
+                    } else {
+                        FoxyVpnService.start(context)
+                    }
                 }
             }
         }
-    }
 
-    private fun launchMainActivity(context: Context) {
-        val intent =
-            Intent(context, MainActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            }
-        context.startActivity(intent)
-    }
-
-    companion object {
-        const val ACTION_TOGGLE_VPN = "com.vauth.foxyvpn.action.TOGGLE_VPN"
+        private fun launchMainActivity(context: Context) {
+            val intent =
+                Intent(context, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                }
+            context.startActivity(intent)
+        }
 
         fun updateAll(context: Context, state: ConnectionState) {
             val appWidgetManager = AppWidgetManager.getInstance(context) ?: return
@@ -123,7 +124,7 @@ class QuickConnectWidgetProvider : AppWidgetProvider() {
             val views = RemoteViews(context.packageName, R.layout.widget_quick_connect)
 
             val toggleIntent =
-                Intent(context, QuickConnectWidgetProvider::class.java).apply {
+                Intent(context, ToggleReceiver::class.java).apply {
                     action = ACTION_TOGGLE_VPN
                 }
             val pendingIntent =

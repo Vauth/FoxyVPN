@@ -61,13 +61,13 @@ class TokenStore(context: Context) {
         synchronized(sessionLock) {
             runCatching {
                     val access = prefs.getString(KEY_ACCESS_TOKEN, null)?.takeIf { it.isNotBlank() }
-                    mutableStorageError.value = null
-                    if (access == null) return@runCatching null
                     val refresh =
                         prefs.getString(KEY_REFRESH_TOKEN, null)?.takeIf { it.isNotBlank() }
+                    mutableStorageError.value = null
+                    if (access == null && refresh == null) return@runCatching null
                     val expiresAt = prefs.getLong(KEY_EXPIRES_AT, 0L)
                     mutableStorageError.value = null
-                    RuntimeAuth(access, refresh, expiresAt)
+                    RuntimeAuth(access ?: "", refresh, expiresAt)
                 }
                 .onFailure {
                     storageFailure(
@@ -80,7 +80,7 @@ class TokenStore(context: Context) {
 
     fun hasValidAccessToken(): Boolean {
         val auth = loadAuth() ?: return false
-        if (auth.expiresAtEpochSeconds <= 0L) return false
+        if (auth.accessToken.isBlank() || auth.expiresAtEpochSeconds <= 0L) return false
         val nowSeconds = System.currentTimeMillis() / 1000
         return auth.expiresAtEpochSeconds - nowSeconds > CLOCK_SKEW_TOLERANCE_SECONDS
     }

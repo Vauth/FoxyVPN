@@ -3,6 +3,7 @@ package com.vauth.foxyvpn.data
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -85,12 +86,7 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                         "Untrusted challenge origin"
                     }
                     val base = "https://${origin.host}"
-                    if (!challengedBody.isNullOrEmpty() && isChallengePage(challengedBody)) {
-                        val solverJar = SimpleCookieJar()
-                        val solver = newSolverClient(solverJar)
-                        solveChallengePage(challengedBody, base, userAgent, solver, solverJar)
-                        return@withContext
-                    }
+                    val solverConfigUA = FoxyRemoteConfig.current.solver.headers["User-Agent"]
                     val defaultBase =
                         runCatching { FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken.toHttpUrl() }
                             .getOrNull()?.let { "https://${it.host}" } ?: "https://api.accounts.firefox.com"
@@ -102,12 +98,20 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                             "https://accounts.firefox.com",
                         ).distinct()
                     var lastError: FastlyChallengeError? = null
+                    val candidateUAs =
+                        listOfNotNull(
+                            solverConfigUA,
+                            FirefoxAccountHeaders.browserUserAgent,
+                            userAgent.takeIf { it.isNotBlank() },
+                        ).distinct()
                     for (candidateBase in bases) {
-                        for (candidateUA in listOf(userAgent, FirefoxAccountHeaders.browserUserAgent, FirefoxAccountHeaders.desktopUserAgent).distinct()) {
+                        for (candidateUA in candidateUAs) {
                             try {
                                 if (solveChallengeOnHost(candidateBase, candidateUA)) {
                                     return@withContext
                                 }
+                            } catch (cancellation: CancellationException) {
+                                throw cancellation
                             } catch (error: FastlyChallengeError) {
                                 lastError = error
                             } catch (e: Exception) {
@@ -153,12 +157,14 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         allowChallenge: Boolean = false,
     ): String {
         val builder = Request.Builder().url(url)
-        for ((key, value) in FoxyRemoteConfig.current.solver.headers) {
+        val solverHeaders = FoxyRemoteConfig.current.solver.headers
+        for ((key, value) in solverHeaders) {
             builder.header(key, value)
         }
+        val effectiveUA = solverHeaders["User-Agent"] ?: userAgent
         val request =
             builder
-                .header("User-Agent", userAgent)
+                .header("User-Agent", effectiveUA)
                 .header("Accept", accept)
                 .build()
         client.newCall(request).awaitResponse().use { response ->
@@ -225,14 +231,16 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
     ): String {
         val patUrl = "$prefixUrl/pat?token=${URLEncoder.encode(token, "UTF-8")}"
         val builder = Request.Builder().url(patUrl)
-        for ((key, value) in FoxyRemoteConfig.current.solver.headers) {
+        val solverHeaders = FoxyRemoteConfig.current.solver.headers
+        for ((key, value) in solverHeaders) {
             builder.header(key, value)
         }
+        val effectiveUA = solverHeaders["User-Agent"] ?: userAgent
         val request =
             builder
                 .header("Accept", "text/plain")
                 .header("Content-Type", "application/json")
-                .header("User-Agent", userAgent)
+                .header("User-Agent", effectiveUA)
                 .header("Origin", baseOrigin(prefixUrl))
                 .post(ByteArray(0).toRequestBody(null))
                 .build()
@@ -398,6 +406,8 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
         val page =
             try {
                 fetchText(solver, pageUrl, userAgent = userAgent, allowChallenge = true)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
             } catch (_: Exception) {
                 return false
             }
@@ -447,14 +457,16 @@ class FastlyChallengeSolver(private val cookieJar: SimpleCookieJar) {
                     .toString()
                     .toRequestBody("application/json".toMediaType())
             val builder = Request.Builder().url("$prefixUrl/fst-post-back")
-            for ((key, value) in FoxyRemoteConfig.current.solver.headers) {
+            val solverHeaders = FoxyRemoteConfig.current.solver.headers
+            for ((key, value) in solverHeaders) {
                 builder.header(key, value)
             }
+            val effectiveUA = solverHeaders["User-Agent"] ?: userAgent
             val request =
                 builder
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
-                    .header("User-Agent", userAgent)
+                    .header("User-Agent", effectiveUA)
                     .header("Origin", baseOrigin(prefixUrl))
                     .post(postBody)
                     .build()

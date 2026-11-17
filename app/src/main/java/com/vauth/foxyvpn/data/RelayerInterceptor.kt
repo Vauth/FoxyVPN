@@ -1,9 +1,9 @@
 package com.vauth.foxyvpn.data
 
-import android.util.Base64
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
@@ -45,14 +45,15 @@ class RelayerInterceptor(
         }
 
         var directException: Exception? = null
-        var directFailureResponse: Response? = null
+        var directFailoverCode: Int? = null
         try {
             val directResponse = chain.withConnectTimeout(DIRECT_CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS).proceed(request)
             if (directResponse.isSuccessful || directResponse.code !in config.failoverCodes) {
                 return directResponse
             }
+            directFailoverCode = directResponse.code
             AppLogger.i("Relayer", "Direct connection returned status ${directResponse.code}, starting relayer failover")
-            directFailureResponse = directResponse
+            directResponse.close()
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             AppLogger.i("Relayer", "Direct connection failed (${e.message ?: e::class.java.simpleName}), starting relayer failover")
@@ -64,9 +65,14 @@ class RelayerInterceptor(
                 AppLogger.i("Relayer", "Attempting request via $relayerUrl")
                 val relayed = buildRelayedRequest(request, relayerUrl)
                 val response = chain.proceed(relayed)
+                val relayError = response.header("X-Relay-Error")
+                if (relayError != null) {
+                    AppLogger.w("Relayer", "Relayer $relayerUrl refused: $relayError")
+                    response.close()
+                    continue
+                }
                 if (response.code !in config.failoverCodes) {
                     AppLogger.i("Relayer", "Request succeeded via $relayerUrl (status ${response.code})")
-                    directFailureResponse?.close()
                     return response
                 }
                 AppLogger.w("Relayer", "Relayer $relayerUrl returned failover status ${response.code}")
@@ -78,15 +84,15 @@ class RelayerInterceptor(
         }
 
         AppLogger.w("Relayer", "All candidate relayers failed for request")
-        if (directFailureResponse != null) {
-            return directFailureResponse
-        }
         if (directException != null) {
             when (directException) {
                 is IOException -> throw directException
                 is RuntimeException -> throw directException
                 else -> throw IOException(directException)
             }
+        }
+        if (directFailoverCode != null) {
+            throw IOException("Direct request failed with HTTP $directFailoverCode and all candidate relayers failed")
         }
         return chain.proceed(request)
     }
@@ -126,21 +132,22 @@ class RelayerInterceptor(
 
     private fun buildRelayedRequest(originalRequest: Request, relayerBaseUrl: String): Request {
         val originalUrl = originalRequest.url.toString()
-        val b64 = Base64.encodeToString(
-            originalUrl.toByteArray(Charsets.UTF_8),
-            Base64.URL_SAFE or Base64.NO_WRAP,
-        ).trim()
         val rawBase = relayerBaseUrl.trim()
         val base = if (rawBase.startsWith("http://", ignoreCase = true) || rawBase.startsWith("https://", ignoreCase = true)) {
             rawBase
         } else {
             "https://$rawBase"
         }
-        val relayerUrl = when {
-            base.endsWith("?url=") -> "$base$b64"
-            base.endsWith("&url=") -> "$base$b64"
-            base.contains("?") -> "${base}&url=$b64"
-            else -> "${base.trimEnd('/')}/?url=$b64"
+        val targetHttpUrl = base.toHttpUrlOrNull()
+        val relayerUrl: String = if (targetHttpUrl != null) {
+            targetHttpUrl.newBuilder()
+                .setQueryParameter("url", originalUrl)
+                .build()
+                .toString()
+        } else {
+            val sep = if (base.contains("?")) "&" else "?"
+            val encoded = java.net.URLEncoder.encode(originalUrl, "UTF-8")
+            "$base${sep}url=$encoded"
         }
         return originalRequest.newBuilder()
             .url(relayerUrl)

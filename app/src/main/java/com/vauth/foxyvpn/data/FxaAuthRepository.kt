@@ -106,33 +106,6 @@ class FxaAuthRepository(
             }
         }
 
-    suspend fun completeBrowserLoginWithTokens(
-        accessToken: String,
-        refreshToken: String?,
-        expiresInSeconds: Long,
-    ): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            val epoch = tokenStore.sessionEpoch
-            runCatching {
-                    loginMutex.withLock {
-                        check(tokenStore.sessionEpoch == epoch) { "Sign-in was superseded" }
-                        val ttl =
-                            if (expiresInSeconds > 0) expiresInSeconds
-                            else DEFAULT_ACCESS_TOKEN_TTL_SECONDS.toLong()
-                        tokenStore.completeLoginIfCurrent(
-                            RuntimeAuth(
-                                accessToken = accessToken.trim(),
-                                refreshToken = refreshToken?.trim()?.ifBlank { null },
-                                expiresAtEpochSeconds = System.currentTimeMillis() / 1000 + ttl,
-                            ),
-                            epoch,
-                        )
-                        Unit
-                    }
-                }
-                .onFailure { if (it is CancellationException) throw it }
-        }
-
     suspend fun completeBrowserLogin(sessionToken: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             val epoch = tokenStore.sessionEpoch
@@ -223,11 +196,14 @@ class FxaAuthRepository(
             val tokenData =
                 try {
                     FirefoxAccountHeaders.refresh(client)
-                    try {
-                        executeFxaRequest(fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken, jsonBody = body)
-                    } catch (_: FastlyBlockedException) {
-                        executeFxaRequest(fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthFallback, jsonBody = body)
-                    }
+                    val primaryUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken
+                    val fallbackUrl = resolveOAuthFallback(primaryUrl)
+                    executeFxaRequest(
+                        fullUrl = primaryUrl,
+                        jsonBody = body,
+                        fallbackUrl = fallbackUrl,
+                        isOAuth = true,
+                    )
                 } catch (rejected: FxaApiError) {
                     throw FxaRefreshFailure(
                         rejected.message ?: "FxA rejected the refresh token",
@@ -286,7 +262,17 @@ class FxaAuthRepository(
         }
 
     private fun FxaApiError.isPermanentRefreshRejection(): Boolean {
-        return statusCode == 400 || statusCode == 401 || statusCode == 403 || errno == 108
+        return errno == 108 || (statusCode == 400 && (
+            message?.contains("invalid_grant", ignoreCase = true) == true ||
+            message?.contains("invalid token", ignoreCase = true) == true
+        ))
+    }
+
+    private fun resolveOAuthFallback(primaryUrl: String): String {
+        val configured = FoxyRemoteConfig.current.endpoints.controlPlane.oauthFallback
+        return if (configured != primaryUrl) configured
+        else if (primaryUrl.contains("oauth.accounts.firefox.com")) "https://api.accounts.firefox.com/v1/oauth/token"
+        else "https://oauth.accounts.firefox.com/v1/token"
     }
 
     private fun expiryFrom(tokenData: JSONObject): Long {
@@ -311,8 +297,11 @@ class FxaAuthRepository(
                     .header("Authorization", header)
                     .post("{}".toRequestBody(jsonMediaType))
                     .build()
-            runCatching {
+            try {
                 client.newCall(request).awaitResponse().use { }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (_: Exception) {
             }
         }
 
@@ -331,20 +320,29 @@ class FxaAuthRepository(
         }
         var tokenData: JSONObject? = null
         var lastError: Throwable? = null
-        for (attempt in 0 until 10) {
-            coroutineContext.ensureActive()
-            try {
-                tokenData = exchangeSessionWithOAuthCode(sessionToken)
-                break
-            } catch (cancellation: CancellationException) {
-                throw cancellation
-            } catch (e: Exception) {
-                lastError = e
-                if (e.isUnconfirmedSession() && attempt < 9) {
-                    delay(CONFIRM_POLL_DELAY_MS)
-                    continue
+        try {
+            tokenData = exchangeSessionDirect(sessionToken)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (_: Exception) {
+            tokenData = null
+        }
+        if (tokenData == null) {
+            for (attempt in 0 until 10) {
+                coroutineContext.ensureActive()
+                try {
+                    tokenData = exchangeSessionWithOAuthCode(sessionToken)
+                    break
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (e: Exception) {
+                    lastError = e
+                    if (e.isUnconfirmedSession() && attempt < 9) {
+                        delay(CONFIRM_POLL_DELAY_MS)
+                        continue
+                    }
+                    throw e
                 }
-                throw e
             }
         }
         val data = tokenData ?: throw (lastError ?: FxaApiError("Sign-in failed", null, 500))
@@ -363,6 +361,28 @@ class FxaAuthRepository(
         )
         destroySession(sessionToken)
     }
+
+    private suspend fun exchangeSessionDirect(sessionToken: String): JSONObject =
+        withContext(Dispatchers.IO) {
+            val body = JSONObject().apply {
+                put("client_id", FIREFOX_CLIENT_ID)
+                put("grant_type", "fxa-credentials")
+                put("scope", OAUTH_SCOPE)
+                put("access_type", "offline")
+            }
+            val primaryUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken
+            val tokens = executeFxaRequest(
+                fullUrl = primaryUrl,
+                jsonBody = body,
+                sessionToken = sessionToken,
+                fallbackUrl = resolveOAuthFallback(primaryUrl),
+                isOAuth = true,
+            )
+            if (tokens.optString("access_token").isBlank()) {
+                throw FxaApiError("Direct token response is missing access token", null, 500)
+            }
+            tokens
+        }
 
     private suspend fun exchangeSessionWithOAuthCode(sessionToken: String): JSONObject =
         withContext(Dispatchers.IO) {
@@ -403,6 +423,7 @@ class FxaAuthRepository(
                     fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.authorization,
                     jsonBody = authorizeBody,
                     sessionToken = sessionToken,
+                    isOAuth = true,
                 )
 
             val code = authResponse.optString("code", "")
@@ -419,11 +440,14 @@ class FxaAuthRepository(
                     put("code_verifier", verifier)
                 }
 
+            val primaryUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken
             val tokens =
                 executeFxaRequest(
-                    fullUrl = FoxyRemoteConfig.current.endpoints.controlPlane.oauthToken,
+                    fullUrl = primaryUrl,
                     jsonBody = tokenBody,
                     sessionToken = null,
+                    fallbackUrl = resolveOAuthFallback(primaryUrl),
+                    isOAuth = true,
                 )
 
             if (tokens.optString("access_token").isBlank()) {
@@ -438,39 +462,77 @@ class FxaAuthRepository(
         method: String = "POST",
         jsonBody: JSONObject,
         sessionToken: String? = null,
+        fallbackUrl: String? = null,
+        isOAuth: Boolean = false,
     ): JSONObject =
         withTimeout(120_000L) {
             withContext(Dispatchers.IO) {
-                val url = fullUrl.toHttpUrl()
-                val origin = "${url.scheme}://${url.host}"
+                var currentUrl = fullUrl.toHttpUrl()
                 val bodyBytes = jsonBody.toString().toByteArray(Charsets.UTF_8)
                 val hawkCreds = sessionToken?.let { deriveHawkCredentials(it) }
 
-                fun buildRequest(): Request {
-                    val builder =
-                        Request.Builder()
-                            .url(url)
-                            .applyFirefoxHeaders()
-                            .header("Content-Type", "application/json")
+                fun buildRequest(targetUrl: HttpUrl): Request {
+                    val builder = Request.Builder().url(targetUrl)
+                    if (isOAuth) {
+                        FirefoxAccountHeaders.applyOAuth(builder)
+                    } else {
+                        builder.applyFirefoxHeaders().header("Content-Type", "application/json")
+                    }
                     if (hawkCreds != null) {
                         builder.header(
                             "Authorization",
-                            hawkHeader(method, url, hawkCreds.first, hawkCreds.second, bodyBytes),
+                            hawkHeader(method, targetUrl, hawkCreds.first, hawkCreds.second, bodyBytes),
                         )
                     }
                     builder.method(method, bodyBytes.toRequestBody(jsonMediaType))
                     return builder.build()
                 }
 
-                var response: Response = client.newCall(buildRequest()).awaitResponse()
+                var response: Response = client.newCall(buildRequest(currentUrl)).awaitResponse()
+
+                if (response.code == 406 && fallbackUrl != null) {
+                    val candidateFallback = fallbackUrl.toHttpUrl()
+                    val fallbackReq = buildRequest(candidateFallback)
+                    val fallbackResp =
+                        try {
+                            client.newCall(fallbackReq).awaitResponse()
+                        } catch (cancellation: CancellationException) {
+                            throw cancellation
+                        } catch (_: Exception) {
+                            null
+                        }
+                    if (fallbackResp != null) {
+                        if (fallbackResp.isSuccessful) {
+                            response.close()
+                            response = fallbackResp
+                            currentUrl = candidateFallback
+                        } else if (fallbackResp.code == 400) {
+                            val fbText = fallbackResp.body?.readBoundedText().orEmpty()
+                            val isInvalid = fbText.contains("108") || fbText.contains("invalid_grant", ignoreCase = true)
+                            if (isInvalid) {
+                                response.close()
+                                response = fallbackResp
+                                currentUrl = candidateFallback
+                            } else {
+                                fallbackResp.close()
+                            }
+                        } else {
+                            fallbackResp.close()
+                        }
+                    }
+                }
+
                 var attempts = 1
                 while (response.code == 406 && attempts < FXA_MAX_CHALLENGE_ATTEMPTS) {
                     val challengedBody = response.use { it.body?.readBoundedText().orEmpty() }
                     try {
+                        val solverUA =
+                            if (isOAuth) FirefoxAccountHeaders.browserUserAgent
+                            else FirefoxAccountHeaders.controlPlaneUserAgent
                         challengeSolver.solveAndInstall(
                             challengedBody,
-                            origin,
-                            FirefoxAccountHeaders.controlPlaneUserAgent,
+                            currentUrl.toString(),
+                            solverUA,
                         )
                     } catch (cancellation: CancellationException) {
                         throw cancellation
@@ -479,7 +541,7 @@ class FxaAuthRepository(
                         FoxyRemoteConfig.triggerRefresh()
                         throw FastlyBlockedException(FRIENDLY_406_MESSAGE, solveFailure)
                     }
-                    response = client.newCall(buildRequest()).awaitResponse()
+                    response = client.newCall(buildRequest(currentUrl)).awaitResponse()
                     attempts++
                 }
 

@@ -36,7 +36,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vauth.foxyvpn.R
 import com.vauth.foxyvpn.data.ProxyStateStore
 import com.vauth.foxyvpn.data.RECOMMENDED_COUNTRY_CODE
@@ -52,23 +51,6 @@ private sealed class LocationRow {
     data class CountryHeader(val country: VpnCountry) : LocationRow()
 
     data class CityRow(val country: VpnCountry, val cityIndex: Int) : LocationRow()
-}
-
-@Composable
-fun ServerListScreen(
-    serverListClient: ServerListClient,
-    proxyStateStore: ProxyStateStore,
-    onServerSelected: () -> Unit,
-    onBack: () -> Unit,
-    viewModel: ServerListViewModel =
-        viewModel(factory = ServerListViewModel.factory(serverListClient, proxyStateStore)),
-) {
-    ServerListScreen(
-        viewModel = viewModel,
-        proxyStateStore = proxyStateStore,
-        onServerSelected = onServerSelected,
-        onBack = onBack,
-    )
 }
 
 @Composable

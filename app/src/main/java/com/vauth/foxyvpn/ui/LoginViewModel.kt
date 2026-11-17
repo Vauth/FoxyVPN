@@ -47,48 +47,6 @@ class LoginViewModel(private val repository: FxaAuthRepository) : ViewModel() {
         _uiState.value = LoginUiState()
     }
 
-    fun completeBrowserLoginWithTokens(
-        accessToken: String,
-        refreshToken: String?,
-        expiresInSeconds: Long,
-    ) {
-        if (operation?.isActive == true || _uiState.value.isLoading || _uiState.value.signedIn || _uiState.value.browserStartUrl == null) return
-        val requestGeneration = ++generation
-        _uiState.update { it.copy(isLoading = true, errorMessage = null) }
-        operation =
-            viewModelScope.launch {
-                try {
-                    val result =
-                        withTimeout(120_000L) {
-                            repository.completeBrowserLoginWithTokens(
-                                accessToken,
-                                refreshToken,
-                                expiresInSeconds,
-                            )
-                        }
-                    if (generation != requestGeneration) return@launch
-                    result
-                        .onSuccess {
-                            _uiState.update { it.copy(browserStartUrl = null, signedIn = true) }
-                        }
-                        .onFailure {
-                            _uiState.update { s -> s.copy(errorMessage = it.message ?: "Browser sign-in failed. Please try again.") }
-                        }
-                } catch (_: TimeoutCancellationException) {
-                    if (generation == requestGeneration)
-                        _uiState.update { it.copy(errorMessage = "Sign-in timed out. Try again.") }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    if (generation == requestGeneration)
-                        _uiState.update { it.copy(errorMessage = "Sign-in failed. Try again.") }
-                } finally {
-                    if (generation == requestGeneration)
-                        _uiState.update { it.copy(isLoading = false) }
-                }
-            }
-    }
-
     fun completeBrowserLogin(sessionToken: String) {
         if (operation?.isActive == true || _uiState.value.isLoading || _uiState.value.signedIn || _uiState.value.browserStartUrl == null) return
         val requestGeneration = ++generation

@@ -246,8 +246,8 @@ fun HomeScreen(
                         Icon(
                             imageVector = Icons.Filled.Power,
                             contentDescription =
-                                if (state == ConnectionState.DISCONNECTED) "Connect"
-                                else "Disconnect",
+                                if (state == ConnectionState.DISCONNECTED) stringResource(R.string.home_connect)
+                                else stringResource(R.string.home_disconnect),
                             tint = ringColor,
                             modifier = Modifier.size(56.dp),
                         )
@@ -259,9 +259,9 @@ fun HomeScreen(
                 Text(
                     text =
                         when (state) {
-                            ConnectionState.CONNECTED -> "Connected"
-                            ConnectionState.CONNECTING -> "Connecting\u2026"
-                            ConnectionState.DISCONNECTED -> "Disconnected"
+                            ConnectionState.CONNECTED -> stringResource(R.string.home_state_connected)
+                            ConnectionState.CONNECTING -> stringResource(R.string.home_state_connecting)
+                            ConnectionState.DISCONNECTED -> stringResource(R.string.home_state_disconnected)
                         },
                     style =
                         MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
@@ -271,7 +271,8 @@ fun HomeScreen(
 
                 if (state == ConnectionState.CONNECTING) {
                     Text(
-                        if (lastError != null) "Retrying connection\u2026 Tap to cancel" else "Tap to cancel",
+                        if (lastError != null) stringResource(R.string.home_retrying_tap_to_cancel)
+                        else stringResource(R.string.home_tap_to_cancel),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -311,7 +312,7 @@ fun HomeScreen(
                 ) {
                     Column(Modifier.padding(16.dp)) {
                         Text(
-                            "Location",
+                            stringResource(R.string.home_location),
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -380,7 +381,7 @@ fun HomeScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    "Current IP",
+                                    stringResource(R.string.home_current_ip),
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -407,8 +408,8 @@ fun HomeScreen(
                             ) {
                                 Text(
                                     if (isConnected) {
-                                        if (proxyOnlyActive) "Proxy active" else "Protected"
-                                    } else "Exposed",
+                                        if (proxyOnlyActive) stringResource(R.string.home_proxy_active) else stringResource(R.string.home_protected)
+                                    } else stringResource(R.string.home_exposed),
                                     style =
                                         MaterialTheme.typography.labelSmall.copy(
                                             fontWeight = FontWeight.Bold
@@ -441,7 +442,7 @@ fun HomeScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    "Data Used",
+                                    stringResource(R.string.home_data_used),
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -503,7 +504,7 @@ fun HomeScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                "Monthly Quota Remaining",
+                                stringResource(R.string.home_monthly_quota_remaining),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.weight(1f),
@@ -514,8 +515,8 @@ fun HomeScreen(
                                     remaining != null && max != null ->
                                         "${formatBytes(remaining)} / ${formatBytes(max)}"
                                     remaining != null -> formatBytes(remaining)
-                                    isUnlimited -> "Unlimited"
-                                    max != null -> "Limited to ${formatBytes(max)}"
+                                    isUnlimited -> stringResource(R.string.home_unlimited)
+                                    max != null -> stringResource(R.string.home_limited_to, formatBytes(max))
                                     else -> "\u2014"
                                 }
                             Text(

@@ -63,7 +63,7 @@
             android:name=".widget.QuickConnectWidgetProvider"
             android:label="@string/quick_connect"
             android:icon="@drawable/widget_preview"
-            android:exported="false">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
@@ -71,6 +71,10 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/quick_connect_widget_info" />
         </receiver>
+
+        <receiver
+            android:name=".widget.QuickConnectWidgetProvider$ToggleReceiver"
+            android:exported="false" />
         
         <provider
             android:name="androidx.core.content.FileProvider"

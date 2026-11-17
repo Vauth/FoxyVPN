@@ -9,6 +9,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Request
+import org.json.JSONObject
 
 private const val EXIT_CHECK_TIMEOUT_SECONDS = 15L
 
@@ -63,6 +64,21 @@ class ExitCheck {
                 ip = line.removePrefix("ip=").trim()
             } else if (line.startsWith("loc=")) {
                 loc = line.removePrefix("loc=").trim()
+            }
+        }
+        if (ip.isBlank() || loc.isBlank()) {
+            runCatching {
+                val json = JSONObject(body)
+                if (ip.isBlank()) {
+                    ip = json.optString("ip").ifBlank { json.optString("query") }.trim()
+                }
+                if (loc.isBlank()) {
+                    loc =
+                        json.optString("country_code")
+                            .ifBlank { json.optString("countryCode") }
+                            .ifBlank { json.optString("loc") }
+                            .trim()
+                }
             }
         }
         if (!SettingsStore.isValidIpAddress(ip)) {

@@ -488,6 +488,15 @@ object SingBoxConfigBuilder {
                         put(
                             JSONObject().apply {
                                 put(
+                                    "domain_suffix",
+                                    JSONArray().apply {
+                                        put("google.com")
+                                        put("googleapis.com")
+                                        put("gstatic.com")
+                                        put("android.com")
+                                    },
+                                )
+                                put(
                                     "port",
                                     JSONArray().apply {
                                         put(5228)

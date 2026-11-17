@@ -26,7 +26,7 @@ import com.vauth.foxyvpn.data.SessionStatus
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
-private const val SESSION_RESTORE_TIMEOUT_MS = 8_000L
+private const val SESSION_RESTORE_TIMEOUT_MS = 15_000L
 
 @Composable
 fun SplashScreen(
