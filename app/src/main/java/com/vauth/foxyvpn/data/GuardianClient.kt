@@ -120,9 +120,16 @@ class GuardianClient(
                 var passFailure: Exception? = null
                 try {
                     pass = fetchProxyPass(endpoint, accessToken)
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
                 } catch (invalid: TokenInvalidError) {
-                    runCatching { activateGuardian(endpoint, accessToken) }
-                    pass = runCatching { fetchProxyPass(endpoint, accessToken) }.getOrNull()
+                    try {
+                        activateGuardian(endpoint, accessToken)
+                        pass = fetchProxyPass(endpoint, accessToken)
+                    } catch (cancellation: CancellationException) {
+                        throw cancellation
+                    } catch (_: Exception) {
+                    }
                 } catch (exceeded: QuotaExceededError) {
                     quotaExceeded = exceeded
                 } catch (e: Exception) {
@@ -137,14 +144,18 @@ class GuardianClient(
                         "${endpoint.trimEnd('/')}/api/v1/fpn/status"
                     }
                 val statusEntitlement =
-                    runCatching {
+                    try {
                         authorizedRequest("GET", statusUrl, accessToken).use { resp ->
                             if (resp.code == 200) {
                                 val text = resp.body?.readBoundedText().orEmpty()
                                 parseEntitlement(JSONObject(text))
                             } else null
                         }
-                    }.getOrNull()
+                    } catch (cancellation: CancellationException) {
+                        throw cancellation
+                    } catch (_: Exception) {
+                        null
+                    }
 
                 val remaining =
                     pass?.quotaRemaining
@@ -259,7 +270,7 @@ class GuardianClient(
     }
 }
 
-internal fun jwtExpiryEpochSeconds(token: String): Long? {
+internal fun jwtExpiryEpochSeconds(token: String, nowSeconds: Long = System.currentTimeMillis() / 1_000L): Long? {
     val parts = token.split('.')
     if (parts.size < 2) return null
     val payload =
@@ -275,5 +286,26 @@ internal fun jwtExpiryEpochSeconds(token: String): Long? {
                 )
             }
             .getOrNull() ?: return null
-    return runCatching { JSONObject(payload).optLong("exp", 0L) }.getOrNull()?.takeIf { it > 0 }
+    return runCatching {
+        val json = JSONObject(payload)
+        val exp = json.optLong("exp", 0L)
+        if (exp <= 0L) return@runCatching null
+        val iat = json.optLong("iat", 0L)
+        val nbf = json.optLong("nbf", 0L)
+        val start = when {
+            nbf > 0L -> nbf
+            iat > 0L -> iat
+            else -> 0L
+        }
+        if (start > 0L && exp > start) {
+            val offset = nowSeconds - start
+            if (kotlin.math.abs(offset) > 60L) {
+                nowSeconds + (exp - start)
+            } else {
+                exp
+            }
+        } else {
+            exp
+        }
+    }.getOrNull()
 }

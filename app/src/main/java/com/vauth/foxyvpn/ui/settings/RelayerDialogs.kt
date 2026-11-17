@@ -1,6 +1,5 @@
 package com.vauth.foxyvpn.ui.settings
 
-import android.util.Base64
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -49,6 +48,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 
 private const val MAX_SAVED_RELAYER_DRAFT_CHARS = 4096
@@ -77,38 +77,71 @@ private suspend fun probeRelayerEndpoint(targetRelayerUrl: String?): RelayerProb
             .callTimeout(4, TimeUnit.SECONDS)
             .build()
         try {
-            val probeTarget = FoxyRemoteConfig.current.endpoints.latencyProbe.ifBlank { "https://1.1.1.1" }
-            val requestUrl = if (targetRelayerUrl != null) {
-                val b64 = Base64.encodeToString(
-                    probeTarget.toByteArray(Charsets.UTF_8),
-                    Base64.URL_SAFE or Base64.NO_WRAP,
-                ).trim()
+            val start = System.nanoTime()
+            if (targetRelayerUrl != null) {
                 val rawBase = targetRelayerUrl.trim()
                 val base = if (rawBase.startsWith("http://", ignoreCase = true) || rawBase.startsWith("https://", ignoreCase = true)) {
                     rawBase
                 } else {
                     "https://$rawBase"
                 }
-                when {
-                    base.endsWith("?url=") -> "$base$b64"
-                    base.endsWith("&url=") -> "$base$b64"
-                    base.contains("?") -> "${base}&url=$b64"
-                    else -> "${base.trimEnd('/')}/?url=$b64"
-                }
-            } else {
-                probeTarget
-            }
-            val request = Request.Builder()
-                .url(requestUrl)
-                .header("Cache-Control", "no-cache, no-store")
-                .build()
-            val start = System.nanoTime()
-            client.newCall(request).execute().use { response ->
-                if (response.code in 200..499) {
-                    val ms = ((System.nanoTime() - start) / 1_000_000L).coerceAtLeast(1L).toInt()
-                    RelayerProbeState.Success(ms)
+                val httpUrl = base.toHttpUrlOrNull()
+                val probeUrl: String = if (httpUrl != null) {
+                    httpUrl.newBuilder()
+                        .setQueryParameter("health", "1")
+                        .build()
+                        .toString()
                 } else {
-                    RelayerProbeState.Failed
+                    val sep = if (base.contains("?")) "&" else "?"
+                    "$base${sep}health=1"
+                }
+                val request = Request.Builder()
+                    .url(probeUrl)
+                    .header("Accept", "application/json")
+                    .header("Cache-Control", "no-cache, no-store")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (response.code in 200..299 && response.header("X-Relay-Error") == null) {
+                        val ms = ((System.nanoTime() - start) / 1_000_000L).coerceAtLeast(1L).toInt()
+                        return@withContext RelayerProbeState.Success(ms)
+                    } else if (response.code == 404) {
+                        val allowedTarget = FoxyRemoteConfig.current.endpoints.serverList
+                        val fallbackUrl: String = if (httpUrl != null) {
+                            httpUrl.newBuilder()
+                                .setQueryParameter("url", allowedTarget)
+                                .build()
+                                .toString()
+                        } else {
+                            val sep = if (base.contains("?")) "&" else "?"
+                            val encoded = java.net.URLEncoder.encode(allowedTarget, "UTF-8")
+                            "$base${sep}url=$encoded"
+                        }
+                        val fbReq = Request.Builder()
+                            .url(fallbackUrl)
+                            .header("Cache-Control", "no-cache, no-store")
+                            .build()
+                        client.newCall(fbReq).execute().use { fbResp ->
+                            if (fbResp.code in 200..499 && fbResp.header("X-Relay-Error") == null) {
+                                val ms = ((System.nanoTime() - start) / 1_000_000L).coerceAtLeast(1L).toInt()
+                                return@withContext RelayerProbeState.Success(ms)
+                            }
+                        }
+                    }
+                }
+                RelayerProbeState.Failed
+            } else {
+                val probeTarget = FoxyRemoteConfig.current.endpoints.latencyProbe.ifBlank { "https://1.1.1.1" }
+                val request = Request.Builder()
+                    .url(probeTarget)
+                    .header("Cache-Control", "no-cache, no-store")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (response.code in 200..499) {
+                        val ms = ((System.nanoTime() - start) / 1_000_000L).coerceAtLeast(1L).toInt()
+                        RelayerProbeState.Success(ms)
+                    } else {
+                        RelayerProbeState.Failed
+                    }
                 }
             }
         } catch (_: Exception) {

@@ -5,7 +5,8 @@ internal fun credentialDeadlineMillis(
     nowWallMillis: Long,
     nowElapsedMillis: Long,
 ): Long {
-    val maximumAge = 5 * 60_000L
+    val defaultLifetime = 10 * 60_000L
+    val maximumAge = 24 * 60 * 60_000L
     val expiryMillis =
         expirySeconds?.let { seconds ->
             when {
@@ -15,9 +16,9 @@ internal fun credentialDeadlineMillis(
             }
         }
     val lifetime =
-        if (expiryMillis == null) maximumAge
+        if (expiryMillis == null) defaultLifetime
         else if (expiryMillis <= nowWallMillis) 0L
-        else (expiryMillis - nowWallMillis - 30_000L).coerceIn(0L, maximumAge)
+        else (expiryMillis - nowWallMillis).coerceIn(0L, maximumAge)
     return if (nowElapsedMillis > Long.MAX_VALUE - lifetime) Long.MAX_VALUE
     else nowElapsedMillis + lifetime
 }

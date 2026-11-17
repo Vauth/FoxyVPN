@@ -70,7 +70,7 @@ class SettingsStore(context: Context) {
         }
 
     var automaticRecovery: Boolean
-        get() = prefs.getBoolean("automatic_recovery", false)
+        get() = prefs.getBoolean("automatic_recovery", true)
         set(value) {
             prefs.edit().putBoolean("automatic_recovery", value).apply()
         }
@@ -657,7 +657,6 @@ class SettingsStore(context: Context) {
         const val RELAYER_AUTOMATIC = "AUTOMATIC"
         const val RELAYER_DIRECT = "DIRECT"
         const val RELAYER_CUSTOM = "CUSTOM"
-        val DEFAULT_RELAYED_ENDPOINTS = setOf("guardian")
         private const val KEY_RELAYER_PROVIDER = "relayer_provider"
         private const val KEY_CUSTOM_RELAYER_URL = "custom_relayer_url"
         private const val KEY_RELAYED_ENDPOINTS = "relayed_endpoints"

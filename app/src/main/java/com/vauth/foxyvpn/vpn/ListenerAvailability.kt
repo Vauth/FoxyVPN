@@ -53,15 +53,4 @@ internal object ListenerAvailability {
             )
         }
     }
-
-    suspend fun requireAvailable(
-        ports: List<Int>,
-        bindAddress: String = "127.0.0.1",
-        maxAttempts: Int = 5,
-        delayMs: Long = 200L,
-    ) = requireAvailable(
-        listeners = ports.map { bindAddress to it },
-        maxAttempts = maxAttempts,
-        delayMs = delayMs,
-    )
 }

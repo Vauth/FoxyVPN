@@ -35,7 +35,6 @@ import com.vauth.foxyvpn.data.ServerListClient
 import com.vauth.foxyvpn.data.SettingsStore
 import com.vauth.foxyvpn.data.TokenInvalidError
 import com.vauth.foxyvpn.data.TunnelSettings
-import com.vauth.foxyvpn.data.awaitResponse
 import com.vauth.foxyvpn.data.formatBytesPerSecond
 import com.vauth.foxyvpn.data.model.ConnectionState
 import com.vauth.foxyvpn.data.model.ProxyCandidate
@@ -63,9 +62,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class VpnLiveStats(
     val txRateBytesPerSec: Long = 0L,
@@ -75,7 +76,8 @@ data class VpnLiveStats(
 
 private const val TAG = "FoxyVpnService"
 private const val SERVER_LIST_FETCH_TIMEOUT_MS = 15_000L
-private const val PROXY_PASS_FETCH_BUDGET_MS = 60_000L
+private const val PROXY_PASS_FETCH_BUDGET_MS = 120_000L
+private const val CREDENTIAL_EXPIRY_GRACE_MS = 60_000L
 private const val PROXY_PASS_RETRY_MS = 5_000L
 private const val WAKE_LOCK_TAG = "com.vauth.foxyvpn:vpn-cpu"
 private const val WIFI_LOCK_TAG = "com.vauth.foxyvpn:vpn-wifi"
@@ -264,14 +266,13 @@ class FoxyVpnService : VpnService() {
         stopMonitoring()
         releaseWakeLocks()
         val server = commandServer
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
+        runBlocking(Dispatchers.IO) {
+            withTimeoutOrNull(2500L) {
                 interruptNativeStart(server)
                 opMutex.withLock { teardown() }
-            } finally {
-                scope.cancel()
             }
         }
+        scope.cancel()
         (applicationContext as FoxyVpnApp)
             .tokenStore
             .clearSessionInvalidationListener(sessionInvalidationListener)
@@ -482,9 +483,9 @@ class FoxyVpnService : VpnService() {
                             }
                         }
                         deadline = installedCredentialDeadline.get()
-                        nextDelay =
-                            (deadline - SystemClock.elapsedRealtime() - PROXY_PASS_FETCH_BUDGET_MS)
-                                .coerceAtLeast(0L)
+                        val computedDelay =
+                            deadline - SystemClock.elapsedRealtime() - PROXY_PASS_FETCH_BUDGET_MS
+                        nextDelay = if (computedDelay > 0L) computedDelay else 10_000L
                         AppLogger.i(TAG, "proxy pass replaced through the scoped core API")
                     } catch (error: Exception) {
                         if (
@@ -502,12 +503,9 @@ class FoxyVpnService : VpnService() {
                             error,
                         )
                         nextDelay =
-                            minOf(
-                                maxOf(
-                                    PROXY_PASS_RETRY_MS,
-                                    (error as? GuardianHttpError)?.retryAfterMs ?: 0L,
-                                ),
-                                (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L),
+                            maxOf(
+                                PROXY_PASS_RETRY_MS,
+                                (error as? GuardianHttpError)?.retryAfterMs ?: 0L,
                             )
                     }
                 }
@@ -520,7 +518,8 @@ class FoxyVpnService : VpnService() {
             scope.launch {
                 while (isActive) {
                     val remaining =
-                        installedCredentialDeadline.get() - SystemClock.elapsedRealtime()
+                        installedCredentialDeadline.get() + CREDENTIAL_EXPIRY_GRACE_MS -
+                            SystemClock.elapsedRealtime()
                     if (remaining > 0L) {
                         delay(remaining)
                         continue
@@ -533,7 +532,10 @@ class FoxyVpnService : VpnService() {
                         )
                             return@launch
 
-                        if (SystemClock.elapsedRealtime() >= installedCredentialDeadline.get()) {
+                        if (
+                            SystemClock.elapsedRealtime() >=
+                                installedCredentialDeadline.get() + CREDENTIAL_EXPIRY_GRACE_MS
+                        ) {
                             _lastError.value = "Proxy credentials expired. Reconnect to retry."
                             requestDisconnect("installed credential deadline reached")
                             return@launch
@@ -1082,7 +1084,7 @@ class FoxyVpnService : VpnService() {
                                 ?.getNetworkCapabilities(it)
                         }
                     if (
-                        capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) !=
+                        capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) !=
                             true
                     ) {
                         synchronized(credentialCommitLock) {
@@ -1113,21 +1115,9 @@ class FoxyVpnService : VpnService() {
                             settings.effectiveCustomEdgeAddress == null
                     ) {
 
-                        val directWorks =
-                            urls.all { url ->
-                                try {
-                                    val request = okhttp3.Request.Builder().url(url).build()
-                                    ControlPlaneHttp.client.newCall(request).awaitResponse().use {
-                                        it.isSuccessful
-                                    }
-                                } catch (cancelled: CancellationException) {
-                                    throw cancelled
-                                } catch (_: Exception) {
-                                    false
-                                }
-                            }
+                        val networkAvailable = firstUsableNetwork() != null
                         if (
-                            directWorks &&
+                            networkAvailable &&
                                 current() &&
                                 firstUsableNetwork() == network &&
                                 recoveryBudget.tryAcquire(SystemClock.elapsedRealtime())

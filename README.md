@@ -32,6 +32,8 @@
 
 ### Performance & Censorship Resistance
 - **MASQUE over HTTP/1.1, HTTP/2, and HTTP/3 (QUIC)**
+- **Control-Plane Edge Relayer & Automatic Failover**
+- **Dynamic Remote Configuration & Endpoint Sync**
 - **TLS Fragmentation (Record & Packet)**
 - **uTLS Fingerprint Emulation**
 - **Upstream Proxy Chaining**
@@ -41,6 +43,7 @@
 - **Automatic Connection Recovery**
 
 ### User Experience & System Integration
+- **Light, Dark & System Adaptive Themes**
 - **Real-Time Traffic & Latency Diagnostics**
 - **Public & Exit IP Detection**
 - **Global Server Locations**
