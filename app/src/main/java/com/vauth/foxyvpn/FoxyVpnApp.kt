@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.content.res.Configuration
 import com.vauth.foxyvpn.data.ControlPlaneHttp
 import com.vauth.foxyvpn.data.CrashReporter
+import com.vauth.foxyvpn.data.EdgeScanner
 import com.vauth.foxyvpn.data.FoxyRemoteConfig
 import com.vauth.foxyvpn.data.FxaAuthRepository
 import com.vauth.foxyvpn.data.GuardianClient
@@ -68,6 +69,8 @@ class FoxyVpnApp : Application(), AppContainer {
                 )
             } else null
         }
+        EdgeScanner.upstreamProxyProvider = ControlPlaneHttp.upstreamProxyProvider
+        EdgeScanner.bootstrapDnsConfigProvider = ControlPlaneHttp.bootstrapDnsConfigProvider
         ControlPlaneHttp.relayerConfigProvider = {
             RelayerConfig(
                 provider = settingsStore.relayerProvider,

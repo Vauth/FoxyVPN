@@ -382,13 +382,24 @@ class SettingsStore(context: Context) {
     var customEdgeAddress: String
         get() = prefs.getString(KEY_CUSTOM_EDGE_ADDRESS, "") ?: ""
         set(value) {
-            val normalized = value.trim().lowercase()
+            val normalized = value.trim().lowercase().removeSuffix(".")
             if (normalized.isNotEmpty() && !isValidEdgeHost(normalized)) return
             prefs.edit().putString(KEY_CUSTOM_EDGE_ADDRESS, normalized).apply()
         }
 
     val effectiveCustomEdgeAddress: String?
         get() = customEdgeAddress.takeIf { isValidEdgeHost(it) }
+
+    var customSni: String
+        get() = prefs.getString(KEY_CUSTOM_SNI, "") ?: ""
+        set(value) {
+            val normalized = value.trim().lowercase().removeSuffix(".")
+            if (normalized.isNotEmpty() && !isValidHostname(normalized)) return
+            prefs.edit().putString(KEY_CUSTOM_SNI, normalized).apply()
+        }
+
+    val effectiveCustomSni: String?
+        get() = customSni.takeIf { isValidHostname(it) }
 
     val localProxyAuthEnabled: Boolean
         get() = prefs.getBoolean("local_proxy_auth_enabled", false)
@@ -702,6 +713,7 @@ class SettingsStore(context: Context) {
         const val DEFAULT_MAX_CONCURRENT_STREAMS = 32
         private const val KEY_PROXY_ONLY_MODE = "proxy_only_mode"
         private const val KEY_CUSTOM_EDGE_ADDRESS = "custom_edge_address"
+        private const val KEY_CUSTOM_SNI = "custom_sni"
         private const val KEY_UPSTREAM_PROXY_ENABLED = "upstream_proxy_enabled"
         private const val KEY_UPSTREAM_PROXY_TYPE = "upstream_proxy_type"
         private const val KEY_UPSTREAM_PROXY_HOST = "upstream_proxy_host"

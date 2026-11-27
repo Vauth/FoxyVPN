@@ -22,6 +22,7 @@ import com.vauth.foxyvpn.FoxyVpnApp
 import com.vauth.foxyvpn.MainActivity
 import com.vauth.foxyvpn.data.AppLogger
 import com.vauth.foxyvpn.data.ControlPlaneHttp
+import com.vauth.foxyvpn.data.EdgeScanner
 import com.vauth.foxyvpn.data.FoxyRemoteConfig
 import com.vauth.foxyvpn.data.FxaRefreshFailure
 import com.vauth.foxyvpn.data.GUARDIAN_ENDPOINT_DEFAULT
@@ -649,11 +650,14 @@ class FoxyVpnService : VpnService() {
 
                 if (proxyOnlyMode) {
                     ControlPlaneHttp.socketProtector = null
+                    EdgeScanner.socketProtector = null
                 } else {
                     ControlPlaneHttp.socketProtector = { socket -> protect(socket) }
+                    EdgeScanner.socketProtector = { socket -> protect(socket) }
                 }
 
                 ControlPlaneHttp.networkProvider = { firstUsableNetwork() }
+                EdgeScanner.networkProvider = { firstUsableNetwork() }
 
                 suspend fun mintProxyPass(): ProxyPass {
                     var auth = app.authRepository.ensureFreshAccessToken()
@@ -982,7 +986,9 @@ class FoxyVpnService : VpnService() {
         releaseResources(detachResources())
         if (!ownsCore) return
         ControlPlaneHttp.socketProtector = null
+        EdgeScanner.socketProtector = null
         ControlPlaneHttp.networkProvider = null
+        EdgeScanner.networkProvider = null
         _state.value = ConnectionState.DISCONNECTED
         _vpnLiveStats.value = VpnLiveStats()
         _connectedAtElapsedMs.value = null

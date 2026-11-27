@@ -222,7 +222,7 @@ object ControlPlaneHttp {
     @Volatile private var cachedDnsOverHttps: DnsOverHttps? = null
     private val dohLock = Any()
 
-    private fun getOrCreateDoh(dohUrl: String): DnsOverHttps? {
+    internal fun getOrCreateDoh(dohUrl: String): DnsOverHttps? {
         if (cachedDohUrl == dohUrl) {
             val cached = cachedDnsOverHttps
             if (cached != null) return cached

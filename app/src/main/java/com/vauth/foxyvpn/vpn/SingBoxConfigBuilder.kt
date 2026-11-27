@@ -352,7 +352,8 @@ object SingBoxConfigBuilder {
                     val tls =
                         JSONObject().apply {
                             put("enabled", true)
-                            put("server_name", candidate.host)
+                            val customSni = settings.effectiveCustomSni
+                            put("server_name", customSni ?: candidate.host)
                             if (targetVersion != 3) {
                                 put(
                                     "utls",
