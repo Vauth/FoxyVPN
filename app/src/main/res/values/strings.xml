@@ -44,6 +44,9 @@
     <string name="settings_proxy_only_mode">Proxy-only mode</string>
     <string name="settings_proxy_only_help">Run local proxy servers without VPN</string>
     <string name="settings_custom_edge_address">Custom edge address</string>
+    <string name="settings_custom_sni">Custom SNI</string>
+    <string name="settings_domain">Domain</string>
+    <string name="dialog_custom_sni_help">Sets the TLS server name to this hostname instead of the MASQUE hostname. Use a hostname under *.m1.fastly-masque.net; leave blank for the default.</string>
     <string name="settings_transport_protocol">Transport protocol</string>
     <string name="settings_tls_fragmentation">TLS fragmentation</string>
     <string name="settings_browser_tls_fingerprint">Browser TLS fingerprint</string>
@@ -181,6 +184,10 @@
     <string name="dialog_dns_direct_system">Direct via local network</string>
     <string name="dialog_dns_custom_doh">HTTPS DoH endpoint</string>
     <string name="dialog_custom_edge_help">Leave empty to resolve the server hostname normally.</string>
+    <string name="edge_scan">Scan</string>
+    <string name="edge_scan_scanning">Scanning… %1$d/%2$d</string>
+    <string name="edge_scan_best">Best edge: %1$s (%2$d ms)</string>
+    <string name="edge_scan_not_found">No working edge found</string>
     <string name="dialog_http_version_help">HTTP protocol version used to tunnel traffic.</string>
     <string name="dialog_mtu_help">Maximum packet size for the tunnel interface.</string>
     <string name="dialog_fragment_help">Fragments TLS packets to bypass censorship.</string>

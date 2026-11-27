@@ -37,7 +37,8 @@
 - **TLS Fragmentation (Record & Packet)**
 - **uTLS Fingerprint Emulation**
 - **Upstream Proxy Chaining**
-- **Custom Edge Override**
+- **Custom Edge Override/Scanner**
+- **Custom SNI**
 - **Multiplexing & Concurrency Controls**
 - **Custom Tunnel MTU**
 - **Automatic Connection Recovery**

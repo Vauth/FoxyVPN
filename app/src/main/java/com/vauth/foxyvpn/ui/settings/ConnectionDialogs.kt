@@ -14,15 +14,19 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -34,7 +38,13 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.vauth.foxyvpn.R
+import com.vauth.foxyvpn.data.EdgeScanner
 import com.vauth.foxyvpn.data.SettingsStore
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val MAX_SAVED_NETWORK_DRAFT_CHARS = 4096
 
@@ -135,6 +145,13 @@ internal fun DnsProviderPickerDialog(
     )
 }
 
+private sealed interface EdgeScanState {
+    data object Idle : EdgeScanState
+    data class Scanning(val tested: Int, val total: Int) : EdgeScanState
+    data class Success(val result: EdgeScanner.EdgeScanResult) : EdgeScanState
+    data object NotFound : EdgeScanState
+}
+
 @Composable
 internal fun CustomEdgeAddressDialog(
     current: String,
@@ -144,6 +161,37 @@ internal fun CustomEdgeAddressDialog(
     var value by rememberSaveable(stateSaver = NetworkDraftSaver) { mutableStateOf(current) }
     val trimmed = value.trim()
     val isValid = trimmed.isEmpty() || SettingsStore.isValidEdgeHost(trimmed)
+    val scope = rememberCoroutineScope()
+    var scanJob by remember { mutableStateOf<Job?>(null) }
+    var scanState by remember { mutableStateOf<EdgeScanState>(EdgeScanState.Idle) }
+    DisposableEffect(Unit) {
+        onDispose { scanJob?.cancel() }
+    }
+    val isScanning = scanState is EdgeScanState.Scanning
+    val startScan: () -> Unit = {
+        scanJob?.cancel()
+        scanState = EdgeScanState.Scanning(0, EdgeScanner.HOST_COUNT)
+        scanJob = scope.launch {
+            val result = try {
+                EdgeScanner.scanBestEdge { tested, total ->
+                    withContext(Dispatchers.Main) {
+                        val currentState = scanState
+                        val prev = if (currentState is EdgeScanState.Scanning) currentState.tested else 0
+                        scanState = EdgeScanState.Scanning(maxOf(prev, tested), total)
+                    }
+                }
+            } catch (_: CancellationException) {
+                scanState = EdgeScanState.Idle
+                return@launch
+            }
+            if (result != null) {
+                value = result.address
+                scanState = EdgeScanState.Success(result)
+            } else {
+                scanState = EdgeScanState.NotFound
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -165,6 +213,97 @@ internal fun CustomEdgeAddressDialog(
                 )
                 Text(
                     stringResource(R.string.dialog_custom_edge_help),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                when (val state = scanState) {
+                    is EdgeScanState.Success -> Text(
+                        stringResource(R.string.edge_scan_best, state.result.address, state.result.ms),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    EdgeScanState.NotFound -> Text(
+                        stringResource(R.string.edge_scan_not_found),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    else -> {}
+                }
+                if (isScanning) {
+                    val scanning = scanState as EdgeScanState.Scanning
+                    LinearProgressIndicator(
+                        progress = { scanning.tested.toFloat() / scanning.total.coerceAtLeast(1).toFloat() },
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                    )
+                    Text(
+                        stringResource(R.string.edge_scan_scanning, scanning.tested, scanning.total),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    TextButton(
+                        onClick = {
+                            scanJob?.cancel()
+                            scanState = EdgeScanState.Idle
+                        },
+                        modifier = Modifier.padding(top = 4.dp),
+                    ) {
+                        Text(stringResource(R.string.cancel))
+                    }
+                } else {
+                    TextButton(
+                        onClick = startScan,
+                        modifier = Modifier.padding(top = 4.dp),
+                    ) {
+                        Text(stringResource(R.string.edge_scan))
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(trimmed) }, enabled = isValid) {
+                Text(stringResource(R.string.save))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+@Composable
+internal fun CustomSniDialog(
+    current: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var value by rememberSaveable(stateSaver = NetworkDraftSaver) { mutableStateOf(current) }
+    val trimmed = value.trim()
+    val isValid = trimmed.isEmpty() || SettingsStore.isValidHostname(trimmed)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.settings_custom_sni)) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    label = { Text(stringResource(R.string.settings_domain)) },
+                    keyboardOptions =
+                        KeyboardOptions(
+                            keyboardType = KeyboardType.Ascii,
+                            autoCorrectEnabled = false,
+                        ),
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    isError = !isValid,
+                )
+                Text(
+                    stringResource(R.string.dialog_custom_sni_help),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp),

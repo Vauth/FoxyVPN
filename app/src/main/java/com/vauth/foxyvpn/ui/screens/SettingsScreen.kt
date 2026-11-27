@@ -56,6 +56,7 @@ import com.vauth.foxyvpn.ui.ProxyEditor
 import com.vauth.foxyvpn.ui.ProxySettingsViewModel
 import com.vauth.foxyvpn.ui.settings.ConcurrencyPickerDialog
 import com.vauth.foxyvpn.ui.settings.CustomEdgeAddressDialog
+import com.vauth.foxyvpn.ui.settings.CustomSniDialog
 import com.vauth.foxyvpn.ui.settings.DnsProviderPickerDialog
 import com.vauth.foxyvpn.ui.settings.HttpVersionPickerDialog
 import com.vauth.foxyvpn.ui.settings.IpModePickerDialog
@@ -84,6 +85,7 @@ private enum class SettingsDialog {
     DNS_PROVIDER,
     BOOTSTRAP_DNS_PROVIDER,
     EDGE_ADDRESS,
+    CUSTOM_SNI,
     SPLIT_TUNNEL,
     HTTP_VERSION,
     IP_MODE,
@@ -114,6 +116,7 @@ fun SettingsScreen(
     var customBootstrapDohUrl by remember { mutableStateOf(settingsStore.customBootstrapDohUrl) }
     var proxyOnlyMode by remember { mutableStateOf(settingsStore.proxyOnlyMode) }
     var customEdgeAddress by remember { mutableStateOf(settingsStore.customEdgeAddress) }
+    var customSni by remember { mutableStateOf(settingsStore.customSni) }
     var excludedApps by remember { mutableStateOf(settingsStore.excludedApps) }
     var includedApps by remember { mutableStateOf(settingsStore.includedApps) }
     var bypassLocalNetwork by remember { mutableStateOf(settingsStore.bypassLocalNetwork) }
@@ -266,6 +269,15 @@ fun SettingsScreen(
             onConfirm = {
                 customEdgeAddress = it
                 settingsStore.customEdgeAddress = it
+                activeDialog = SettingsDialog.NONE
+            },
+        )
+        SettingsDialog.CUSTOM_SNI -> CustomSniDialog(
+            current = customSni,
+            onDismiss = { activeDialog = SettingsDialog.NONE },
+            onConfirm = {
+                customSni = it
+                settingsStore.customSni = it
                 activeDialog = SettingsDialog.NONE
             },
         )
@@ -558,6 +570,14 @@ fun SettingsScreen(
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                 },
                 modifier = Modifier.clickable { activeDialog = SettingsDialog.EDGE_ADDRESS },
+            )
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.settings_custom_sni)) },
+                supportingContent = { Text(customSni.ifBlank { stringResource(R.string.not_set) }) },
+                trailingContent = {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+                },
+                modifier = Modifier.clickable { activeDialog = SettingsDialog.CUSTOM_SNI },
             )
             ListItem(
                 headlineContent = { Text(stringResource(R.string.settings_transport_protocol)) },
